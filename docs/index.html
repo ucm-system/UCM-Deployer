@@ -260,7 +260,9 @@ footer {
     <a class="nav-link" href="#step2"><span class="num">2</span>镜像准备</a>
     <a class="nav-link" href="#step3"><span class="num">3</span>容器准备</a>
     <a class="nav-link" href="#step4"><span class="num">4</span>环境预检</a>
+    <a class="nav-link" href="#step5"><span class="num">5</span>服务部署</a>
     <div class="nav-group">进阶</div>
+    <a class="nav-link" href="#batch">（可选）批量部署</a>
     <a class="nav-link" href="#precheck-config">预检参数配置</a>
     <a class="nav-link" href="#tools">容器与镜像清理</a>
     <a class="nav-link" href="#faq">常见问题</a>
@@ -271,23 +273,25 @@ footer {
 <div class="main">
 <header class="hero">
   <h1>UCM Deployer</h1>
-  <p class="lead">面向 vLLM / vLLM-Ascend / SGLang 运行环境的 Windows 桌面工具。专注 UCM 安装与环境预检：服务器管理、镜像准备、容器准备、容器内检查与运维清理。</p>
+  <p class="lead">面向 vLLM / vLLM-Ascend / SGLang 运行环境的 Windows 桌面工具。专注 UCM 安装、环境预检与服务部署：服务器管理、镜像准备、容器准备、容器内检查、推理服务拉起与运维清理。</p>
   <div class="actions">
     <a class="btn btn-primary" href="#quickstart">快速开始</a>
     <a class="btn btn-outline" href="https://github.com/ucm-system/UCM-Deployer/releases/latest/download/UCM-Deployer.exe">下载 EXE</a>
   </div>
-  <p class="meta">当前版本 v0.3.6 · 支持 Ascend NPU · NVIDIA GPU · Linux 服务器 · Docker</p>
+  <p class="meta">当前版本 v0.5.0 · 支持 Ascend NPU · NVIDIA GPU · Linux 服务器 · Docker</p>
 </header>
 
 <div class="container">
 <section id="intro">
   <h2>工具简介</h2>
-  <p>UCM Deployer 是 Unified Cache Management（UCM）的安装与环境预检工具。它把原本需要手工执行的 SSH 命令、镜像导入、离线 whl 安装、<code>docker run</code> 参数拼装和容器内环境检查，收敛为四个可视化步骤；不负责启动或部署推理服务。</p>
+  <p>UCM Deployer 是 Unified Cache Management（UCM）的安装、环境预检与服务部署工具。它把原本需要手工执行的 SSH 命令、镜像导入、离线 whl 安装、<code>docker run</code> 参数拼装和容器内环境检查，收敛为五个向导步骤（另提供面向多台服务器场景的可选批量部署）；步骤 5 支持一键写入 UCM 配置文件并在容器内拉起推理服务。</p>
   <div class="flow">
     <div class="step"><strong>① 服务器管理</strong>SSH 登录与设备探测</div>
     <div class="step"><strong>② 镜像准备</strong>复用或构建 UCM 镜像</div>
     <div class="step"><strong>③ 容器准备</strong>创建或复用 UCM 容器</div>
-    <div class="step"><strong>④ 环境预检</strong>驱动 / 内核 / 带宽检查</div>
+    <div class="step"><strong>④ 环境预检</strong>驱动 / 内核 / 带宽 / SMMU 检查</div>
+    <div class="step"><strong>⑤ 服务部署</strong>写入 UCM 配置并拉起推理服务</div>
+    <div class="step"><strong>可选</strong>批量部署（多台服务器）</div>
   </div>
   <div class="cards">
     <div class="card"><h3>凭据复用</h3><p>密码或私钥登录，密码 Fernet 加密保存在本机，下次打开自动复用。</p></div>
@@ -295,7 +299,8 @@ footer {
     <div class="card"><h3>镜像准备</h3><p>单一来源选择器：复用服务器镜像、离线导入 tar 包，或由目标服务器直连仓库拉取；本地无需 Docker Desktop。</p></div>
     <div class="card"><h3>按需构建</h3><p>仅在基础镜像未安装 UCM 时上传 wrapt、UCM、ucm-toolkit whl 并构建新镜像。</p></div>
     <div class="card"><h3>命令透明</h3><p>所有 Docker 命令先完整展示，允许编辑，再执行，避免黑盒操作。</p></div>
-    <div class="card"><h3>环境预检</h3><p>显式选择容器，检查驱动、内核、共享内存、AIO 与存储带宽；UCM 与驱动版本支持多来源补齐。</p></div>
+    <div class="card"><h3>环境预检</h3><p>显式选择容器，检查驱动、内核、共享内存、AIO、存储带宽与 SMMU；UCM 与驱动版本支持多来源补齐。</p></div>
+    <div class="card"><h3>服务部署</h3><p>一键写入 UCM 配置文件并在容器内后台拉起推理服务，部署过程与启动日志实时可见、可导出。</p></div>
     <div class="card"><h3>运维善后</h3><p>按关键字筛选并清理容器或镜像，删除前展示完整对象列表。</p></div>
   </div>
   <figure class="figure">
@@ -427,11 +432,12 @@ python -m venv .venv
       <tr><td>网络</td><td>NPU：<code>--net=host</code><br>GPU：<code>-p 8000:8000</code></td><td>按设备平台自动生成</td></tr>
     </tbody>
   </table>
-  <h3>挂载配置</h3>
+  <h3>挂载配置（统一挂载表）</h3>
+  <p>KV Cache / 模型 / 自定义挂载统一在同一张表格中维护（类型、宿主机路径、容器内路径、只读四列），共用一套「➕ 添加 / 🗑 移除选中」按钮；选中行可校验挂载点是否位于同一文件系统（KV Cache 要求）。</p>
   <ul>
-    <li><strong>KV Cache 目录</strong>：可添加多个，支持容器内 / 宿主机目录浏览，并可检查文件系统类型。</li>
-    <li><strong>模型路径</strong>：宿主机路径挂载到容器内 <code>/models</code>，默认只读。</li>
-    <li><strong>自定义挂载</strong>：任意宿主机与容器路径映射，可选择只读。</li>
+    <li><strong>KV Cache 行</strong>：容器内路径自动与宿主机相同（锁定不可编辑），支持容器内 / 宿主机目录浏览，并可检查文件系统类型。</li>
+    <li><strong>模型行</strong>：默认预置（宿主机路径留空 = 不挂载），挂载到容器内 <code>/models</code>，默认只读。</li>
+    <li><strong>自定义行</strong>：任意宿主机与容器路径映射，可选择只读。</li>
   </ul>
   <figure class="figure">
     <img src="screenshots/dialog-remote-dirs.png" alt="远程目录浏览对话框" loading="lazy">
@@ -522,8 +528,53 @@ docker run -itd \\
       <tr><td>Ascend HDK</td><td>&gt; 25.2.0，较低版本警告</td></tr>
       <tr><td>存储带宽</td><td>最佳组合聚合带宽 &lt; 8 GB/s 时警告</td></tr>
       <tr><td>AIO 资源</td><td>记录 <code>fs.aio-max-nr</code> 与占用，供带宽超时排查</td></tr>
+      <tr><td>SMMU（Ascend）</td><td>宿主机 <code>dmesg</code> 中出现 arm-smmu-v3 输出时警告（开启 SMMU 会破坏 NPU 直通性能）；dmesg 受限时跳过，避免误判</td></tr>
     </tbody>
   </table>
+</section>
+
+<section id="step5">
+  <span class="step-badge">步骤 5</span>
+  <h2>服务部署</h2>
+  <p>选择目标容器后，一键把 UCM 配置文件写入容器内指定路径，并按你填写的拉起命令在容器内后台启动推理服务。配置区采用与批量部署一致的双页签模式。</p>
+  <h3>操作流程</h3>
+  <ol>
+    <li>「目标容器」下拉选择步骤 3 创建的容器（或点击「🔄 刷新容器」重新读取 <code>docker ps -a</code>）。</li>
+    <li>「UCM 配置文件」页签：已预填默认模板（<code>UcmPipelineStore</code>，<code>Cache|Posix</code> 存储管线），按实际环境修改存储路径、容量与并发等参数；详细参数说明见配置框下方的 <a href="https://support.huawei.com/enterprise/zh/doc/EDOC1100582752/b4b5937b?idPath=7919749%7C251366268%7C250389224%7C263153904%7C268354339">UCM 参数配置说明（华为官方文档，可点击跳转）</a>。</li>
+    <li>「推理服务拉起命令」页签：填写实际拉起命令，命令中直接引用上方「配置文件路径」，服务启动时从该路径读取配置。例如：
+      <pre><code>vllm serve /models/Qwen --ucm-config /etc/ucm/config.yaml ...</code></pre></li>
+    <li>点击「🚀 部署UCM推理服务」。</li>
+  </ol>
+  <h3>部署流水线</h3>
+  <table>
+    <thead><tr><th>阶段</th><th>行为</th></tr></thead>
+    <tbody>
+      <tr><td>容器检查</td><td>确认容器存在且运行中，否则提示回步骤 3</td></tr>
+      <tr><td>写入配置</td><td>以 base64 方式写入配置（对引号 / 换行等特殊字符免疫），目录不存在自动创建</td></tr>
+      <tr><td>配置校验</td><td>回读容器内字节数与本地编码后大小比对，不一致即失败</td></tr>
+      <tr><td>拉起服务</td><td><code>nohup</code> 后台执行拉起命令，输出重定向到容器内 <code>/tmp/ucm-service.log</code></td></tr>
+      <tr><td>启动日志</td><td>2 秒后回读日志尾部 100 行，直接展示服务启动输出</td></tr>
+    </tbody>
+  </table>
+  <div class="callout">
+    <b>日志可导出</b>
+    部署日志面板常驻底部（部署前显示占位引导）；部署完成后可通过「⬇ 导出日志」把当前页签保存到下载目录。
+  </div>
+  <div class="callout">
+    <b>编辑框可拖高</b>
+    配置内容与拉起命令编辑框右下角均有拖动手柄，上下拖动即可调整高度，方便粘贴长配置。
+  </div>
+</section>
+
+<section id="batch">
+  <h2>（可选）批量部署</h2>
+  <p>面向<strong>多台服务器</strong>场景：在一台源服务器制作好镜像后，向多台目标并行执行「镜像分发 → 容器创建 → 环境预检」。单台服务器场景请直接使用步骤 3 / 4 / 5，无需本功能。</p>
+  <ul>
+    <li><strong>布局自上而下</strong>：镜像来源 → 目标服务器 → 部署配置模板 → 批量执行，与步骤 1-4 阅读顺序一致。</li>
+    <li><strong>目标服务器来自步骤 1</strong>：列表与「服务器管理」完全一致，步骤 1 增删改后点「🔄 刷新」同步；注册表为空时表格显示引导。</li>
+    <li><strong>部署配置模板</strong>双页签（容器配置 / 预检配置），挂载配置同样使用统一挂载表，设备差异逐台自动适配。</li>
+    <li><strong>独立进度与日志</strong>：每台服务器一行进度条（分发 45% / 创建 25% / 预检 30% 权重）与独立日志页签，单台失败不影响其余；支持部署数据模板（JSON）导出 / 导入复用。</li>
+  </ul>
 </section>
 
 <section id="precheck-config">

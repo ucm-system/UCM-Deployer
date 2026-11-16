@@ -1,5 +1,5 @@
 site_name: UCM Deployer 使用文档
-site_description: UCM 安装与环境预检工具 —— 服务器管理、镜像准备、容器准备与环境预检指南
+site_description: UCM 安装与环境预检与服务部署工具 —— 服务器管理、镜像准备、容器准备、环境预检与服务部署指南
 site_url: https://ucm-system.github.io/UCM-Deployer/
 repo_url: https://github.com/ucm-system/UCM-Deployer
 repo_name: ucm-system/UCM-Deployer
@@ -46,7 +46,8 @@ nav:
   - 步骤2 · 镜像构建: guide/step2.md
   - 步骤3 · 容器创建: guide/step3.md
   - 步骤4 · 环境预检: guide/step4.md
-  - 步骤5 · 批量部署: guide/step5.md
+  - 步骤5 · 服务部署: guide/step5.md
+  - 可选 · 批量部署: guide/batch.md
   - 预检参数配置: guide/precheck-config.md
   - 工具菜单 · 清理容器/镜像: guide/tools.md
   - 常见问题: guide/faq.md

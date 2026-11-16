@@ -43,6 +43,7 @@
 | 内核 | ≥ 5.10 |
 | 共享内存 /dev/shm | < 512 GiB 警告 |
 | 存储带宽 | 最佳组合聚合带宽 < 8 GB/s 警告 |
+| SMMU（Ascend） | 宿主机 `dmesg` 出现 arm-smmu-v3 输出时警告（开启 SMMU 会破坏 NPU 直通性能）；dmesg 受限时 SKIP |
 
 !!! tip "容器内 npu-smi 报 rc=172 / -8020？"
     `dcmi model initialized failed, because the device is used (ret -8020)` 通常表示 **NPU 正被其他进程/容器占用**（宿主机 `npu-smi info` 可正常查看）——该 WARN 不影响推理与带宽检查，停用占用方后重试即可恢复。

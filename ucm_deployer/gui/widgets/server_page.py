@@ -4,18 +4,22 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -26,6 +30,14 @@ from ...core.device_detector import DeviceDetector
 from ...core.models import DeviceInfo, ServerInfo
 from ..state import AppContext
 from .common import ParallelTaskPanel
+
+
+def _make_cell(text: str, server_id: str) -> QTableWidgetItem:
+    """只读单元格：userData 携带 server_id（操作寻址与行序解耦）。"""
+    item = QTableWidgetItem(text)
+    item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+    item.setData(Qt.UserRole, server_id)
+    return item
 
 
 class ServerEditDialog(QDialog):
@@ -50,6 +62,15 @@ class ServerEditDialog(QDialog):
         self.passphrase_edit.setEchoMode(QLineEdit.Password)
         self.remark_edit = QLineEdit(server.remark if server else "")
 
+        self.key_browse_btn = QPushButton("浏览…")
+        self.key_browse_btn.clicked.connect(self._browse_key)
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.addWidget(self.key_edit)
+        key_row.addWidget(self.key_browse_btn)
+        key_holder = QWidget()
+        key_holder.setLayout(key_row)
+
         form = QFormLayout()
         form.addRow("名称*", self.name_edit)
         form.addRow("主机 IP*", self.host_edit)
@@ -57,7 +78,7 @@ class ServerEditDialog(QDialog):
         form.addRow("用户名", self.user_edit)
         form.addRow("认证方式", self.auth_combo)
         form.addRow("密码", self.password_edit)
-        form.addRow("私钥文件", self.key_edit)
+        form.addRow("私钥文件", key_holder)
         form.addRow("私钥口令", self.passphrase_edit)
         form.addRow("备注", self.remark_edit)
 
@@ -78,14 +99,24 @@ class ServerEditDialog(QDialog):
         self.key_edit.setEnabled(key_mode)
         self.passphrase_edit.setEnabled(key_mode)
 
+    def _browse_key(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择私钥文件", "",
+            "私钥文件 (*.pem *.key *.id_rsa *);;所有文件 (*)")
+        if path:
+            self.key_edit.setText(path)
+
     def _accept(self) -> None:
         if not self.host_edit.text().strip():
             QMessageBox.warning(self, "参数错误", "主机 IP 不能为空")
             return
         try:
-            int(self.port_edit.text() or 22)
+            port = int(self.port_edit.text() or 22)
         except ValueError:
             QMessageBox.warning(self, "参数错误", "端口必须是数字")
+            return
+        if not 1 <= port <= 65535:
+            QMessageBox.warning(self, "参数错误", "端口必须在 1–65535 之间")
             return
         self.accept()
 
@@ -126,107 +157,202 @@ class ServerPage(QWidget):
         super().__init__(parent)
         self.ctx = ctx
         self._detected: Dict[str, DeviceInfo] = {}
+        self._rebuilding = False
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["登录", "名称", "IP", "端口", "用户", "设备", "卡数", "备注"])
+            ["名称", "IP", "端口", "用户", "设备", "卡数", "备注"])
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        for col in (1, 2, 4, 5, 6):
+        for col in (0, 1, 3, 4, 5):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
-        self.table.itemChanged.connect(self._on_item_changed)
+        # 点选行 = 选定当前操作服务器（主从模式，取代复选框列）
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.cellDoubleClicked.connect(self._on_double_clicked)
 
-        add_btn = QPushButton("➕ 添加服务器")
-        edit_btn = QPushButton("✏ 编辑")
-        del_btn = QPushButton("🗑 删除")
-        test_btn = QPushButton("🔌 测试连接")
-        detect_btn = QPushButton("🔍 探测设备")
-        add_btn.clicked.connect(self._add)
-        edit_btn.clicked.connect(self._edit)
-        del_btn.clicked.connect(self._delete)
-        test_btn.clicked.connect(self._test_connections)
-        detect_btn.clicked.connect(self._detect_devices)
+        self.add_btn = QPushButton("➕ 添加服务器")
+        self.edit_btn = QPushButton("✏ 编辑")
+        self.del_btn = QPushButton("🗑 删除")
+        self.test_btn = QPushButton("🔌 测试连接")
+        self.detect_btn = QPushButton("🔍 探测设备")
+        self.add_btn.clicked.connect(self._add)
+        self.edit_btn.clicked.connect(self._edit)
+        self.del_btn.clicked.connect(self._delete)
+        self.test_btn.clicked.connect(self._test_connections)
+        self.detect_btn.clicked.connect(self._detect_devices)
+        self.row_buttons = (self.edit_btn, self.del_btn,
+                            self.test_btn, self.detect_btn)
 
         btns = QHBoxLayout()
-        for b in (add_btn, edit_btn, del_btn, test_btn, detect_btn):
+        for b in (self.add_btn, *self.row_buttons):
             btns.addWidget(b)
         btns.addStretch(1)
 
         self.hint = QLabel(
-            "勾选「登录」选择本次要操作的服务器（一次一台，换勾自动切换）；"
-            "编辑/删除/测试连接/探测设备均作用于勾选的服务器；"
-            "登录信息保存在 ~/.ucm_deployer/servers.json（密码加密）。")
+            "点选一行 = 选定当前操作的服务器（一次一台）；双击行可编辑，右键有快捷操作。"
+            "首次使用请在选定后点击「探测设备」。")
         self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color:#64748b;")
+        self.hint.setToolTip(
+            "登录信息保存在 ~/.ucm_deployer/servers.json，"
+            "密码经 Fernet 加密（密钥同目录）；私钥路径仅保存在本地。")
+
+        # 空状态：0 台服务器时的引导
+        self.empty_hint = QLabel(
+            "还没有服务器\n点击「添加服务器」录入第一台，"
+            "随后探测设备即可进入步骤2")
+        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint.setStyleSheet("color:#94a3b8; font-size:14px;")
+
+        self.table_holder = QWidget()
+        th = QVBoxLayout(self.table_holder)
+        th.setContentsMargins(0, 0, 0, 0)
+        th.addWidget(self.table)
+        th.addWidget(self.empty_hint)
 
         self.panel = ParallelTaskPanel()
+
+        # 表格（上）/ 任务记录（下）可拖动分栏；任务记录常驻显示
+        self.splitter = QSplitter(Qt.Vertical)
+        self.splitter.addWidget(self.table_holder)
+        self.splitter.addWidget(self.panel)
+        self.splitter.setStretchFactor(0, 7)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setChildrenCollapsible(False)
 
         layout = QVBoxLayout(self)
         layout.addLayout(btns)
         layout.addWidget(self.hint)
-        layout.addWidget(self.table, 1)
-        layout.addWidget(self.panel, 2)
+        layout.addWidget(self.splitter, 1)
         self.refresh()      # 打开即显示历史保存的服务器
+
+    def _flash_device_cell(self, server_id: str) -> None:
+        """探测结果融入列表：该行设备单元格短暂绿色高亮后恢复默认。"""
+        for row in range(self.table.rowCount()):
+            head = self.table.item(row, 0)
+            if head is not None and head.data(Qt.UserRole) == server_id:
+                dev_item = self.table.item(row, 4)
+                if dev_item is not None:
+                    dev_item.setForeground(Qt.darkGreen)
+                    QTimer.singleShot(
+                        4000, lambda d=dev_item: d.setData(Qt.ForegroundRole, None))
+                break
+
+    def _update_action_states(self) -> None:
+        has_selection = bool(self.ctx.selected)
+        for b in self.row_buttons:
+            b.setEnabled(has_selection)
 
     # ------------------------------------------------------------ 表格
     def refresh(self) -> None:
-        self.table.itemChanged.disconnect(self._on_item_changed)
-        servers = self.ctx.registry.list_servers()
-        self.table.setRowCount(0)
-        selected_ids = {s.id for s in self.ctx.selected}
-        for s in servers:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            check = QTableWidgetItem()
-            check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            check.setCheckState(Qt.Checked if s.id in selected_ids else Qt.Unchecked)
-            check.setToolTip("勾选 = 登录该服务器（单选）")
-            self.table.setItem(row, 0, check)
-            self.table.setItem(row, 1, QTableWidgetItem(s.name))
-            self.table.setItem(row, 2, QTableWidgetItem(s.host))
-            self.table.setItem(row, 3, QTableWidgetItem(str(s.port)))
-            self.table.setItem(row, 4, QTableWidgetItem(s.username))
-            dev = self.ctx.devices.get(s.id) or s.device
-            self.table.setItem(row, 5, QTableWidgetItem(dev.display if dev else "未检测"))
-            self.table.setItem(row, 6, QTableWidgetItem(str(dev.count if dev else 0)))
-            self.table.setItem(row, 7, QTableWidgetItem(s.remark))
-        self.table.itemChanged.connect(self._on_item_changed)
+        self._rebuilding = True
+        try:
+            servers = self.ctx.registry.list_servers()
+            self.table.setRowCount(0)
+            selected_id = self.ctx.selected[0].id if self.ctx.selected else None
+            for s in servers:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                name_text = s.name or "未命名"
+                if not s.name or s.name == s.host:
+                    name_text = f"{name_text}（未命名）"
+                name_item = _make_cell(name_text, s.id)
+                if not s.name or s.name == s.host:
+                    name_item.setForeground(Qt.gray)
+                self.table.setItem(row, 0, name_item)
+                self.table.setItem(row, 1, _make_cell(s.host, s.id))
+                self.table.setItem(row, 2, _make_cell(str(s.port), s.id))
+                self.table.setItem(row, 3, _make_cell(s.username, s.id))
+                dev = self.ctx.devices.get(s.id) or s.device
+                dev = dev if (dev and dev.count) else None
+                self.table.setItem(
+                    row, 4, _make_cell(dev.display if dev else "未探测", s.id))
+                self.table.setItem(
+                    row, 5, _make_cell(str(dev.count) if dev else "—", s.id))
+                self.table.setItem(row, 6, _make_cell(s.remark, s.id))
+            self.empty_hint.setVisible(len(servers) == 0)
+        finally:
+            self._rebuilding = False
+        # 恢复当前选中行（触发 _on_selection_changed 同步 ctx.selected）
+        if selected_id is not None:
+            for row in range(self.table.rowCount()):
+                it = self.table.item(row, 0)
+                if it is not None and it.data(Qt.UserRole) == selected_id:
+                    self.table.setCurrentCell(row, 0)
+                    break
+        self._update_action_states()
 
     def _current_server(self) -> Optional[ServerInfo]:
-        """当前操作对象：勾选「登录」的服务器（与所有操作按钮一致）。"""
+        """当前操作对象：点选行的服务器（与所有操作按钮一致）。"""
         return self.ctx.selected[0] if self.ctx.selected else None
 
-    def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() != 0:
+    def _on_selection_changed(self) -> None:
+        if self._rebuilding:
             return
-        # 单选语义：勾选某一行时取消其他行的勾选
-        if item.checkState() == Qt.Checked:
-            self.table.itemChanged.disconnect(self._on_item_changed)
-            try:
-                for row in range(self.table.rowCount()):
-                    if row != item.row():
-                        self.table.item(row, 0).setCheckState(Qt.Unchecked)
-            finally:
-                self.table.itemChanged.connect(self._on_item_changed)
         self._collect_selection()
         self.selection_changed.emit()
+        self._update_action_states()
 
     def _collect_selection(self) -> None:
-        servers = self.ctx.registry.list_servers()
+        row = self.table.currentRow()
         selected: List[ServerInfo] = []
-        for row in range(self.table.rowCount()):
-            it = self.table.item(row, 0)
-            if it is not None and it.checkState() == Qt.Checked and row < len(servers):
-                selected.append(servers[row])
-                break  # 单服务器：只取第一台勾选的
+        if row >= 0:
+            sid = self._row_server_id(row)
+            if sid is not None:
+                for s in self.ctx.registry.list_servers():
+                    if s.id == sid:
+                        selected.append(s)
+                        break
         self.ctx.selected = selected
         self.ctx.reset_after_servers_changed()
+
+    def _row_server_id(self, row: int) -> Optional[str]:
+        if row < 0:
+            return None
+        it = self.table.item(row, 0)
+        return it.data(Qt.UserRole) if it is not None else None
+
+    def _on_double_clicked(self, row: int, _col: int) -> None:
+        # 双击行：选定并打开编辑
+        self.table.setCurrentCell(row, 0)
+        if self._current_server() is not None:
+            self._edit()
+
+    def _show_context_menu(self, pos) -> None:
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.table.setCurrentCell(row, 0)
+        if self._current_server() is None:
+            return
+        menu = QMenu(self)
+        act_test = menu.addAction("🔌 测试连接")
+        act_detect = menu.addAction("🔍 探测设备")
+        menu.addSeparator()
+        act_edit = menu.addAction("✏ 编辑")
+        act_del = menu.addAction("🗑 删除")
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if action == act_test:
+            self._test_connections()
+        elif action == act_detect:
+            self._detect_devices()
+        elif action == act_edit:
+            self._edit()
+        elif action == act_del:
+            self._delete()
 
     def ensure_selection(self) -> bool:
         self._collect_selection()
         if not self.ctx.selected:
-            QMessageBox.warning(self, "未选择服务器", "请先勾选要登录的服务器")
+            QMessageBox.warning(self, "未选择服务器", "请先点选一台服务器")
             return False
         return True
 
@@ -235,30 +361,54 @@ class ServerPage(QWidget):
         dlg = ServerEditDialog(self)
         if dlg.exec() == QDialog.Accepted:
             info = dlg.build_server_info()
+            existing = self.ctx.registry.list_servers()
+            dup = next((s for s in existing
+                        if s.host == info.host and s.port == info.port), None)
+            if dup is not None:
+                QMessageBox.warning(
+                    self, "服务器已存在",
+                    f"{info.host}:{info.port} 已在列表中（名称：{dup.name}）。")
+                return
             self.ctx.registry.upsert(info)
-            # 新增后自动勾选登录（省去手动勾选一步）
+            # 新增后自动选定（省去手动点选一步）
             self.ctx.selected = [info]
             self.ctx.devices.pop(info.id, None)
             self.ctx.reset_after_servers_changed()
             self.refresh()
             self.selection_changed.emit()
+            self._flash_device_cell(info.id)
 
     def _edit(self) -> None:
         server = self._current_server()
         if server is None:
             QMessageBox.information(
-                self, "提示", "请先勾选「登录」要编辑的服务器（表格第一列）")
+                self, "提示", "请先点选要编辑的服务器行")
             return
+        old_host, old_port = server.host, server.port
         dlg = ServerEditDialog(self, server)
         if dlg.exec() == QDialog.Accepted:
-            self.ctx.registry.upsert(dlg.build_server_info(server))
+            info = dlg.build_server_info(server)
+            if (info.host, info.port) != (old_host, old_port):
+                dup = next((s for s in self.ctx.registry.list_servers()
+                            if s.id != info.id and s.host == info.host
+                            and s.port == info.port), None)
+                if dup is not None:
+                    QMessageBox.warning(
+                        self, "服务器已存在",
+                        f"{info.host}:{info.port} 已在列表中（名称：{dup.name}）。")
+                    return
+            self.ctx.registry.upsert(info)
+            # 主机/端口可能已改变：旧设备信息必须失效，避免误导后续步骤
+            # （表格设备列随即显示「未探测」，即重新探测的引导）
+            self.ctx.devices.pop(info.id, None)
+            self.ctx.registry.touch(info.id, device=DeviceInfo())
             self.refresh()
 
     def _delete(self) -> None:
         server = self._current_server()
         if server is None:
             QMessageBox.information(
-                self, "提示", "请先勾选「登录」要删除的服务器（表格第一列）")
+                self, "提示", "请先点选要删除的服务器行")
             return
         if QMessageBox.question(self, "确认删除",
                                 f"删除服务器 {server.name} ({server.endpoint}) 的登录信息？"
@@ -275,9 +425,9 @@ class ServerPage(QWidget):
             return
 
         def fn(ssh, tctx):
-            tctx.progress(50, "SSH 连接成功")
+            tctx.progress(50, "SSH 握手成功")
             tctx.log(f"已连接 {ssh.server.endpoint} (用户 {ssh.server.username})")
-            tctx.progress(100, "连接测试完成")
+            tctx.progress(100, "连接成功")
 
         self.panel.run_tasks([(s, fn) for s in self.ctx.selected], "测试连接")
 
@@ -290,10 +440,11 @@ class ServerPage(QWidget):
             def fn(ssh, tctx):
                 tctx.progress(30, "探测设备...")
                 dev = DeviceDetector(ssh).detect()
-                tctx.log(f"探测结果: {dev.display} ({dev.device_type.value})"
+                tctx.log(f"探测结果: {dev.display}"
                          + (f" / {dev.arch}" if dev.arch else ""))
                 if dev.device_type.value == "unknown" or dev.count <= 0:
                     raise RuntimeError("未探测到加速设备(NPU/GPU)")
+                tctx.log("步骤2 构建镜像、步骤3 创建容器将按该设备类型自动适配")
                 self._detected[server.id] = dev
                 tctx.progress(100, dev.display)
             return fn
@@ -305,14 +456,11 @@ class ServerPage(QWidget):
             self.ctx.devices.update(self._detected)
             for sid, dev in self._detected.items():
                 self.ctx.registry.touch(sid, device=dev)
-            dev = next(iter(self._detected.values()))
-            arch = f"，CPU 架构 {dev.arch}" if dev.arch else ""
-            QMessageBox.information(
-                self, "设备探测",
-                f"探测成功：{dev.display}（{dev.device_type.value}）{arch}\n"
-                "步骤2 构建镜像、步骤3 创建容器将按该设备类型自动适配。")
             self.refresh()
             self.selection_changed.emit()
+            # 反馈融入列表：探测到的行设备列短暂高亮
+            for sid in self._detected:
+                self._flash_device_cell(sid)
 
         self.panel.run_tasks([(s, make_fn(s)) for s in self.ctx.selected],
                              "探测设备", on_finished=on_finished)

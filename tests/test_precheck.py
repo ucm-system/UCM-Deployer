@@ -459,6 +459,54 @@ def test_run_with_config_path(fake_ssh):
         "ucm-ctr", mount_path="", skip_bandwidth=True,
         config_path="/root/ucm-deploy/precheck.json")
     assert result.ok
-    cmd = ssh._client.channels[-1].executed_command
+    # run 末尾会追加宿主机 SMMU 检查（dmesg），定位 precheck 命令需按内容匹配
+    cmd = next(c.executed_command for c in ssh._client.channels
+               if "ucm-toolkit run precheck" in c.executed_command)
     assert "--config /root/ucm-deploy/precheck.json" in cmd
     assert "--skip-bandwidth" in cmd
+
+# ============================================================ SMMU（宿主机）
+def test_check_smmu_host_pass_when_absent(fake_ssh):
+    """dmesg 可读且无 arm-smmu-v3 输出 -> PASS（未开启，符合预期）。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^dmesg >/dev/null", stdout="")
+    ssh._client.add(r"dmesg.*grep", stdout="")
+    item = PrecheckRunner(ssh).check_smmu_host()
+    assert item.status == "PASS"
+    assert "未开启" in item.summary
+    assert "宿主机" in item.detail
+
+
+def test_check_smmu_host_warn_when_enabled(fake_ssh):
+    """dmesg 出现 arm-smmu-v3 -> WARN（已开启，建议进 BIOS 关闭）。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^dmesg >/dev/null", stdout="")
+    ssh._client.add(r"dmesg.*grep",
+                    stdout="arm-smmu-v3 arm-smmu-v3.0.auto: probing\n")
+    item = PrecheckRunner(ssh).check_smmu_host()
+    assert item.status == "WARN"
+    assert "已开启" in item.summary
+    assert "arm-smmu-v3" in item.detail
+
+
+def test_check_smmu_host_skip_without_permission(fake_ssh):
+    """dmesg 不可读（权限受限）-> SKIP 并提示手动检查（避免误判为未开启）。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^dmesg >/dev/null", stderr="Operation not permitted",
+                    exit_code=1)
+    item = PrecheckRunner(ssh).check_smmu_host()
+    assert item.status == "SKIP"
+    assert "手动" in item.summary
+
+
+def test_run_appends_smmu_host_item(fake_ssh):
+    """run() 结果附加宿主机 SMMU 检查项（未配置 dmesg 脚本时为 SKIP）。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"ucm-toolkit run precheck", stdout="[PASS] kernel  5.10.0\n")
+    result = PrecheckRunner(ssh).run("ucm-ctr", mount_path="",
+                                     skip_bandwidth=True)
+    by_name = {item.name: item for item in result.items}
+    assert by_name["smmu_host"].status == "SKIP"
+    assert by_name["smmu_host"].name_zh == "SMMU 开关（宿主机）"
+    # SMMU 为 SKIP 时不影响 verdict
+    assert result.verdict == "passed"
