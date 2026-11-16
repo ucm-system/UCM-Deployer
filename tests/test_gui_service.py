@@ -1,28 +1,11 @@
 # -*- coding: utf-8 -*-
-"""步骤5 服务部署页 GUI 测试（offscreen；校验拦截、部署流程、日志面板）。"""
-import time
-
+"""步骤5 服务部署页 GUI 测试（offscreen；纯指引页：三模块内容与无执行组件）。"""
 import pytest
-
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
-
-
-def _automate_message_boxes() -> None:
-    from PySide6.QtWidgets import QMessageBox
-
-    for name in ("information", "warning", "critical", "about"):
-        setattr(QMessageBox, name,
-                staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
-    QMessageBox.question = staticmethod(
-        lambda *a, **k: QMessageBox.StandardButton.Yes)
-    QMessageBox.exec = lambda self, *a, **k: QMessageBox.StandardButton.Ok  # noqa: A001
-
-
-_automate_message_boxes()
 
 
 @pytest.fixture(scope="module")
@@ -31,29 +14,6 @@ def qapp():
 
     app = QApplication.instance() or QApplication([])
     yield app
-
-
-@pytest.fixture(autouse=True)
-def _shutdown_tasks_after_test(qapp):
-    yield
-    from PySide6.QtWidgets import QApplication
-
-    from ucm_deployer.gui.widgets.common import ParallelTaskPanel, _task_threads
-    for w in QApplication.topLevelWidgets():
-        for panel in w.findChildren(ParallelTaskPanel):
-            panel.shutdown()
-    for t in list(_task_threads):
-        t.join(15.0)
-    qapp.processEvents()
-
-
-def _wait_panel(panel, qapp, timeout=60):
-    deadline = time.time() + timeout
-    while panel.is_running() and time.time() < deadline:
-        qapp.processEvents()
-        time.sleep(0.05)
-    qapp.processEvents()
-    return not panel.is_running()
 
 
 def make_ctx(tmp_path):
@@ -70,119 +30,18 @@ def make_ctx(tmp_path):
 def make_page(qapp, tmp_path):
     from ucm_deployer.gui.widgets.service_page import ServicePage
 
-    ctx = make_ctx(tmp_path)
-    page = ServicePage(ctx)
+    page = ServicePage(make_ctx(tmp_path))
     page.resize(1000, 860)
     return page
 
 
-def make_server(ctx):
-    from ucm_deployer.core.models import ServerInfo
-
-    s = ServerInfo.create(name="node-1", host="10.0.0.11",
-                          username="root", password="pw")
-    ctx.registry.upsert(s)
-    server = ctx.registry.get(s.id)
-    ctx.selected = [server]          # ctx.server = selected[0]（只读 property）
-    return server
-
-
-def _script_pipeline(ssh, content_len, service_log="service started\n"):
-    """部署流水线 fake 返回（实例级，LIFO）。"""
-    ssh._client.add(r"^docker inspect", stdout="true\n")
-    ssh._client.add(r"base64 -d", stdout="")
-    ssh._client.add(r"wc -c", stdout=f"{content_len}\n")
-    ssh._client.add(r"nohup", stdout="12345\n")
-    ssh._client.add(r"tail -n", stdout=service_log)
-
-
-def test_service_page_requires_login(qapp, tmp_path):
-    page = make_page(qapp, tmp_path)
-    page._run()          # 未登录 -> 拦截
-    assert page.status_label.text() == "未部署"
-    assert not page.panel.isHidden()   # 日志区常驻（父页面未 show 也成立）
-
-
-def test_service_page_requires_container_and_content(qapp, tmp_path):
-    page = make_page(qapp, tmp_path)
-    make_server(page.ctx)
-    page.container_combo.setCurrentText("ucm-ctr")
-    page.content_edit.setPlainText("")     # 模板默认有预填内容，显式清空
-    page._run()          # 配置内容为空 -> 拦截
-    assert not page.panel.is_running()
-
-
-def test_service_page_deploy_flow(qapp, tmp_path, fake_ssh):
-    page = make_page(qapp, tmp_path)
-    server = make_server(page.ctx)
-    page.container_combo.setCurrentText("ucm-ctr")
-    page.path_edit.setText("/etc/ucm/config.yaml")
-    page.content_edit.setPlainText("ucm:\n  kv_cache: /mnt/kvcache\n")
-    page.start_edit.setPlainText("vllm serve /m --ucm-config /etc/ucm/config.yaml")
-
-    content_len = len(page.content_edit.toPlainText().encode("utf-8"))
-    # docker ps 容器列表快任务 + 部署流水线
-    ssh = None
-    from ucm_deployer.core.ssh_client import SSHClient
-
-    class _Probe:
-        pass
-
-    fake_ssh.add_default(r"docker ps", stdout="ucm-ctr\n")
-    # 部署脚本：连接后才注册实例脚本——用 default_queue 表达流水线时序
-    fake_ssh.add_default(r"^docker inspect", stdout="true\n")
-    fake_ssh.add_default(r"base64 -d", stdout="")
-    fake_ssh.add_default(r"wc -c", stdout=f"{content_len}\n")
-    fake_ssh.add_default(r"nohup", stdout="12345\n")
-    fake_ssh.add_default(r"tail -n", stdout="service started\n")
-
-    page._run()
-    assert not page.panel.isHidden()          # 日志区常驻可见
-    assert _wait_panel(page.panel, qapp)
-    assert "部署完成" in page.status_label.text()
-
-    cmds = []
-    for client in fake_ssh.instances:
-        cmds.extend(c.executed_command for c in client.channels)
-    assert any("base64 -d > /etc/ucm/config.yaml" in c for c in cmds)
-    assert any("nohup vllm serve" in c for c in cmds)
-    assert any("tail -n 100" in c for c in cmds)
-
-
-def test_service_page_grip_only_resizes_itself(qapp, tmp_path):
-    """拖动配置框手柄：只改变自身高度，命令框与其他模块高度不变。"""
-    from PySide6.QtCore import QPoint, Qt
-    from PySide6.QtTest import QTest
+# ============================================================ 指引内容
+def test_service_page_ucm_config_guide(qapp, tmp_path):
+    """模块1：UCM 配置参考模板 + 官方参数文档网址。"""
+    from ucm_deployer.gui.widgets.service_page import UCM_DOC_URL
 
     page = make_page(qapp, tmp_path)
-    page.show()
-    qapp.processEvents()
-    page.tabs.setCurrentIndex(0)       # 配置页签为当前页，手柄可交互
-    page.content_edit.setFixedHeight(90)
-    qapp.processEvents()
-    h0 = page.content_edit.height()
-
-    from ucm_deployer.gui.widgets.common import _EditGrip
-    grip = next(c for c in page.content_edit.children()
-                if isinstance(c, _EditGrip))
-    QTest.mousePress(grip, Qt.LeftButton)
-    QTest.mouseMove(grip, QPoint(grip.width() // 2, grip.height() // 2 + 40))
-    QTest.mouseRelease(grip, Qt.LeftButton)
-    qapp.processEvents()
-
-    assert page.content_edit.height() >= h0 + 40
-    assert not page.panel.is_running()
-
-
-# ============================================================ 部署配置默认值
-def test_service_page_default_configs(qapp, tmp_path):
-    """双页签默认值：UCM 配置模板预填 + 拉起命令空白 + 文档链接可跳转。"""
-    page = make_page(qapp, tmp_path)
-    assert page.tabs.count() == 2
-    assert page.tabs.tabText(0) == "UCM 配置文件"
-    assert page.tabs.tabText(1) == "推理服务拉起命令"
-    # UCM 配置默认模板
-    content = page.content_edit.toPlainText()
+    content = page.cfg_view.toPlainText()
     assert "ucm_connectors:" in content
     assert 'ucm_connector_name: "UcmPipelineStore"' in content
     assert 'store_pipeline: "Cache|Posix"' in content
@@ -190,16 +49,83 @@ def test_service_page_default_configs(qapp, tmp_path):
     assert "posix_capacity_gb: 10240" in content
     assert "posix_io_engine: \"psync\"" in content
     assert "posix_data_trans_concurrency: 128" in content
-    # 拉起命令默认为空（placeholder 引导）
-    assert page.start_edit.toPlainText() == ""
-    # 文档链接（可点击跳转）
-    from ucm_deployer.gui.widgets.service_page import UCM_DOC_URL
-
+    assert page.cfg_view.isReadOnly()
+    # 参考网址可点击跳转
     assert "support.huawei.com" in UCM_DOC_URL
+    labels = " ".join(l.text() for l in page.findChildren(type(page))) or ""
+    from PySide6.QtWidgets import QLabel
+
+    hint_texts = " ".join(l.text() for l in page.findChildren(QLabel))
+    assert UCM_DOC_URL in hint_texts
 
 
+def test_service_page_start_cmd_guide(qapp, tmp_path):
+    """模块2：拉起命令模板含环境变量导出与 --kv-transfer-config 接入块。"""
+    page = make_page(qapp, tmp_path)
+    cmd = page.cmd_view.toPlainText()
+    assert "export ENABLE_UCM_PATCH=1" in cmd
+    assert "export VLLM_CPU_AFFINITY=1" in cmd
+    assert "--kv-transfer-config" in cmd
+    assert '"kv_connector": "UCMConnector"' in cmd
+    assert '"kv_connector_module_path": "ucm.integration.vllm.ucm_connector"' in cmd
+    assert '"kv_role": "kv_both"' in cmd
+    assert "UCM_CONFIG_FILE" in cmd
+    assert "/workspace/ucm_config_example.yaml" in cmd
+    assert page.cmd_view.isReadOnly()
+
+
+def test_service_page_verify_guide(qapp, tmp_path):
+    """模块3：连通性验证模板（health / models / chat completions）。"""
+    page = make_page(qapp, tmp_path)
+    verify = page.verify_view.toPlainText()
+    assert "curl --fail http://127.0.0.1:7800/health" in verify
+    assert "curl --fail http://127.0.0.1:7800/v1/models" in verify
+    assert "curl --fail-with-body http://127.0.0.1:7800/v1/chat/completions" in verify
+    assert '"max_completion_tokens": 512' in verify
+    assert '"enable_thinking": false' in verify
+    assert page.verify_view.isReadOnly()
+
+
+# ============================================================ 纯指引页定位
+def test_service_page_has_no_exec_widgets(qapp, tmp_path):
+    """纯指引页：无部署按钮/容器选择/日志面板等执行组件。"""
+    from PySide6.QtWidgets import QComboBox, QPushButton, QTabWidget
+
+    page = make_page(qapp, tmp_path)
+    btn_texts = [b.text() for b in page.findChildren(QPushButton)]
+    assert not any("部署" in t or "🚀" in t for t in btn_texts)
+    assert not page.findChildren(QComboBox)
+    assert not page.findChildren(QTabWidget)
+    assert not hasattr(page, "panel")
+    assert not hasattr(page, "deploy_btn")
+
+
+def test_service_page_grips_attachable(qapp, tmp_path):
+    """三个展示区均可通过右下角手柄拖动调高。"""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    from ucm_deployer.gui.widgets.common import _EditGrip
+
+    page = make_page(qapp, tmp_path)
+    page.show()
+    qapp.processEvents()
+    page.cfg_view.setFixedHeight(90)
+    qapp.processEvents()
+    h0 = page.cfg_view.height()
+    grip = next(c for c in page.cfg_view.children()
+                if isinstance(c, _EditGrip))
+    QTest.mousePress(grip, Qt.LeftButton)
+    QTest.mouseMove(grip, QPoint(grip.width() // 2, grip.height() // 2 + 40))
+    QTest.mouseRelease(grip, Qt.LeftButton)
+    qapp.processEvents()
+    assert page.cfg_view.height() >= h0 + 40
+    page.close()
+
+
+# ============================================================ 主窗口集成
 def test_service_page_in_main_window(qapp, tmp_path, fake_ssh):
-    """主窗口集成：步骤5 导航到服务部署页，批量部署顺延为第 6 项。"""
+    """主窗口集成：步骤5 为服务部署指引页；任务面板清单不再包含本页。"""
     from ucm_deployer.gui.main_window import MainWindow
 
     fake_ssh.add_default(r"docker ps", stdout="")
@@ -213,5 +139,9 @@ def test_service_page_in_main_window(qapp, tmp_path, fake_ssh):
     win.goto_step(4)
     qapp.processEvents()
     assert win.current_step() == 4
-    assert win.service_page is not None
+    assert not hasattr(win.service_page, "panel")
+    panels = win._all_panels()
+    assert len(panels) == 5
+    assert not hasattr(panels[0].parent(), "service_page") or all(
+        p is not None for p in panels)
     win.close()

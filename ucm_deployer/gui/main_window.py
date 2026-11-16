@@ -244,7 +244,7 @@ class MainWindow(QMainWindow):
     def _all_panels(self):
         return [p.panel for p in (self.server_page, self.image_page,
                                   self.container_page, self.precheck_page,
-                                  self.service_page, self.batch_page)]
+                                  self.batch_page)]
 
     # ------------------------------------------------------------ 导航
     def goto_step(self, row: int) -> None:

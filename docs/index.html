@@ -290,7 +290,7 @@ footer {
     <div class="step"><strong>② 镜像准备</strong>复用或构建 UCM 镜像</div>
     <div class="step"><strong>③ 容器准备</strong>创建或复用 UCM 容器</div>
     <div class="step"><strong>④ 环境预检</strong>驱动 / 内核 / 带宽 / SMMU 检查</div>
-    <div class="step"><strong>⑤ 服务部署</strong>写入 UCM 配置并拉起推理服务</div>
+    <div class="step"><strong>⑤ 服务部署</strong>UCM 配置与拉起命令操作指引</div>
     <div class="step"><strong>可选</strong>批量部署（多台服务器）</div>
   </div>
   <div class="cards">
@@ -300,7 +300,7 @@ footer {
     <div class="card"><h3>按需构建</h3><p>仅在基础镜像未安装 UCM 时上传 wrapt、UCM、ucm-toolkit whl 并构建新镜像。</p></div>
     <div class="card"><h3>命令透明</h3><p>所有 Docker 命令先完整展示，允许编辑，再执行，避免黑盒操作。</p></div>
     <div class="card"><h3>环境预检</h3><p>显式选择容器，检查驱动、内核、共享内存、AIO、存储带宽与 SMMU；UCM 与驱动版本支持多来源补齐。</p></div>
-    <div class="card"><h3>服务部署</h3><p>一键写入 UCM 配置文件并在容器内后台拉起推理服务，部署过程与启动日志实时可见、可导出。</p></div>
+    <div class="card"><h3>服务部署</h3><p>UCM 配置参考模板与官方参数文档、拉起命令模板（环境变量 + --kv-transfer-config 接入）与连通性验证 curl，一键复制照做即可。</p></div>
     <div class="card"><h3>运维善后</h3><p>按关键字筛选并清理容器或镜像，删除前展示完整对象列表。</p></div>
   </div>
   <figure class="figure">
@@ -536,33 +536,63 @@ docker run -itd \\
 <section id="step5">
   <span class="step-badge">步骤 5</span>
   <h2>服务部署</h2>
-  <p>选择目标容器后，一键把 UCM 配置文件写入容器内指定路径，并按你填写的拉起命令在容器内后台启动推理服务。配置区采用与批量部署一致的双页签模式。</p>
-  <h3>操作流程</h3>
+  <p>纯操作指引页，三个模块按操作顺序排布，所有命令与配置均可直接复制使用；在容器内手动完成后按模块3 验证服务连通性。</p>
+  <h3>① UCM 配置文件</h3>
+  <p>页面给出 UCM 配置文件参考默认配置（<code>UcmPipelineStore</code> 连接器，<code>Cache|Posix</code> 存储管线），存储路径、容量与并发等参数按实际环境修改：</p>
+  <pre><code>ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      storage_backends: "/mnt/test"
+      posix_capacity_gb: 10240
+      posix_io_engine: "psync"
+      posix_data_trans_concurrency: 128
+</code></pre>
+  <p>将配置保存为 yaml 文件（如 <code>/workspace/ucm_config_example.yaml</code>，路径可自定义，需与拉起命令中 <code>UCM_CONFIG_FILE</code> 保持一致）；详细参数说明见配置框下方的 <a href="https://support.huawei.com/enterprise/zh/doc/EDOC1100582752/b4b5937b?idPath=7919749%7C251366268%7C250389224%7C263153904%7C268354339">UCM 参数配置说明（华为官方文档，可点击跳转）</a>。</p>
+  <h3>② 推理服务拉起命令（在容器内执行）</h3>
+  <p><strong>注意事项：</strong></p>
   <ol>
-    <li>「目标容器」下拉选择步骤 3 创建的容器（或点击「🔄 刷新容器」重新读取 <code>docker ps -a</code>）。</li>
-    <li>「UCM 配置文件」页签：已预填默认模板（<code>UcmPipelineStore</code>，<code>Cache|Posix</code> 存储管线），按实际环境修改存储路径、容量与并发等参数；详细参数说明见配置框下方的 <a href="https://support.huawei.com/enterprise/zh/doc/EDOC1100582752/b4b5937b?idPath=7919749%7C251366268%7C250389224%7C263153904%7C268354339">UCM 参数配置说明（华为官方文档，可点击跳转）</a>。</li>
-    <li>「推理服务拉起命令」页签：填写实际拉起命令，命令中直接引用上方「配置文件路径」，服务启动时从该路径读取配置。例如：
-      <pre><code>vllm serve /models/Qwen --ucm-config /etc/ucm/config.yaml ...</code></pre></li>
-    <li>点击「🚀 部署UCM推理服务」。</li>
+    <li>拉起服务前需先导出环境变量：<code>export ENABLE_UCM_PATCH=1</code>、<code>export VLLM_CPU_AFFINITY=1</code>；</li>
+    <li>拉起命令后必须附加 <code>--kv-transfer-config</code>，通过 UCMConnector 把 UCM 接入 vLLM；</li>
+    <li>其中 <code>UCM_CONFIG_FILE</code> 为 UCM 配置文件路径，指向①中保存的 yaml（可自定义修改，两处路径必须一致）。</li>
   </ol>
-  <h3>部署流水线</h3>
-  <table>
-    <thead><tr><th>阶段</th><th>行为</th></tr></thead>
-    <tbody>
-      <tr><td>容器检查</td><td>确认容器存在且运行中，否则提示回步骤 3</td></tr>
-      <tr><td>写入配置</td><td>以 base64 方式写入配置（对引号 / 换行等特殊字符免疫），目录不存在自动创建</td></tr>
-      <tr><td>配置校验</td><td>回读容器内字节数与本地编码后大小比对，不一致即失败</td></tr>
-      <tr><td>拉起服务</td><td><code>nohup</code> 后台执行拉起命令，输出重定向到容器内 <code>/tmp/ucm-service.log</code></td></tr>
-      <tr><td>启动日志</td><td>2 秒后回读日志尾部 100 行，直接展示服务启动输出</td></tr>
-    </tbody>
-  </table>
+  <pre><code>export ENABLE_UCM_PATCH=1
+export VLLM_CPU_AFFINITY=1
+
+vllm serve /models/Qwen ... \
+    --kv-transfer-config '{
+        "kv_connector": "UCMConnector",
+        "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "UCM_CONFIG_FILE": "/workspace/ucm_config_example.yaml"
+        }
+    }'
+</code></pre>
+  <p>模板中的模型路径 / 端口等参数按实际填写。</p>
+  <h3>③ 验证连通性（服务就绪后，在宿主机另开终端）</h3>
+  <p>端口 <code>7800</code> 与模型名 <code>qwen3.8</code> 按实际替换：</p>
+  <pre><code>curl --fail http://127.0.0.1:7800/health
+curl --fail http://127.0.0.1:7800/v1/models
+
+curl --fail-with-body http://127.0.0.1:7800/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model": "qwen3.8",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Explain the role of KV cache in large language model inference."
+            }
+        ],
+        "max_completion_tokens": 512,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": false}
+    }'
+</code></pre>
   <div class="callout">
-    <b>日志可导出</b>
-    部署日志面板常驻底部（部署前显示占位引导）；部署完成后可通过「⬇ 导出日志」把当前页签保存到下载目录。
-  </div>
-  <div class="callout">
-    <b>编辑框可拖高</b>
-    配置内容与拉起命令编辑框右下角均有拖动手柄，上下拖动即可调整高度，方便粘贴长配置。
+    <b>可复制 + 可拖高</b>
+    三个模块的配置 / 命令展示框均可直接选中复制，右下角拖动手柄可调整高度，方便完整查看长命令。
   </div>
 </section>
 
