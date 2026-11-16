@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -40,11 +41,21 @@ from ...core.image_builder import (ImageBuildConfig, ImageBuilder,
                                    validate_whl, wheel_distribution,
                                    whl_arch, whl_glibc, whl_python_abi,
                                    whl_version)
-from ...core.models import DeviceType, DockerImage
+from ...core.models import DeviceType, DockerImage, UCMInfo
 from ...core.shell import shq
 from ..state import AppContext
 from .common import (ParallelTaskPanel, QuickTask, combo_ref, fill_image_combo,
                      image_from_ref, setup_image_combo)
+
+
+class _FitStack(QStackedWidget):
+    """高度跟随当前页的堆栈（QStackedWidget 默认按最高页预留，产生大片留白）。"""
+
+    def sizeHint(self):
+        return self.currentWidget().sizeHint()
+
+    def minimumSizeHint(self):
+        return self.currentWidget().minimumSizeHint()
 
 
 class ImagePage(QWidget):
@@ -60,14 +71,23 @@ class ImagePage(QWidget):
         self._updating_pull_command = False
         self._image_runtime: Optional[ImageRuntimeInfo] = None
         self._runtime_cache = {}
+        self._ucm_cache = {}        # ref -> UCMInfo（扫描/底座检查结果，避免重复 SSH）
+        self._scan_installed = []   # [(ref, UCMInfo)] 最近一次扫描发现的已装 UCM 镜像
 
-        # ---------- 1. 准备基础镜像
-        image_box = QGroupBox("1. 准备基础镜像")
-        self.placeholder = QLabel("请先在「1. 服务器管理」勾选要登录的服务器")
+        # ---------- 1. UCM 镜像检查（自动扫描服务器镜像，只给结论提示；
+        #              不再放镜像下拉——选 UCM 镜像创建容器是步骤3 的职责）
+        scan_box = QGroupBox("UCM 镜像检查")
+        self.placeholder = QLabel("请先在「1. 服务器管理」点选要登录的服务器")
         self.placeholder.setProperty("role", "hint")
         self.placeholder.setAlignment(Qt.AlignCenter)
         self.placeholder.setMinimumHeight(48)
+        self.scan_state_label = QLabel("镜像 UCM：进入本页后自动扫描")
+        self.scan_state_label.setWordWrap(True)
+        scan_layout = QVBoxLayout(scan_box)
+        scan_layout.addWidget(self.placeholder)
+        scan_layout.addWidget(self.scan_state_label)
 
+        # ---------- 2. 构建新 UCM 镜像（常驻；基础镜像是构建的输入配置）
         self.image_combo = QComboBox()
         setup_image_combo(self.image_combo)
         self.image_combo.setMinimumWidth(440)
@@ -80,18 +100,17 @@ class ImagePage(QWidget):
         self.source_combo.currentIndexChanged.connect(
             lambda *_: self._update_source_hint())
 
-        self.source_stack = QStackedWidget()
+        self.source_stack = _FitStack()
         self.source_combo.currentIndexChanged.connect(
             self.source_stack.setCurrentIndex)
 
         existing_page = QWidget()
         existing_form = QFormLayout(existing_page)
-        existing_form.addRow("基础镜像", self.image_combo)
-        refresh_btn = QPushButton("🔄 刷新镜像列表")
-        existing_btns = QHBoxLayout()
-        existing_btns.addWidget(refresh_btn)
-        existing_btns.addStretch(1)
-        existing_form.addRow("", existing_btns)
+        refresh_btn = QPushButton("🔄 重新扫描")
+        combo_row = QHBoxLayout()
+        combo_row.addWidget(self.image_combo, 1)
+        combo_row.addWidget(refresh_btn)
+        existing_form.addRow("基础镜像", combo_row)
         self.source_stack.addWidget(existing_page)
 
         tar_page = QWidget()
@@ -136,35 +155,30 @@ class ImagePage(QWidget):
         self.registry_ref_edit.textChanged.connect(self._update_pull_command)
         self.pull_command_edit.textChanged.connect(self._mark_pull_command_dirty)
 
-        check_ucm_btn = QPushButton("✅ 检查所选镜像 UCM")
-        check_ucm_btn.clicked.connect(self._check_ucm)
-        refresh_btn.setToolTip("重新加载服务器上的 docker images")
+        refresh_btn.setToolTip("重新扫描服务器镜像并检查 UCM")
         upload_btn.setToolTip("上传本地镜像包到服务器并执行 docker load")
         pull_btn.setToolTip(
             "在目标服务器上直接执行 docker pull；本地无需安装 Docker Desktop")
-        check_ucm_btn.setToolTip("检查所选基础镜像内是否已安装 UCM（已装可直接跳过构建）")
 
-        image_layout = QVBoxLayout(image_box)
-        image_layout.addWidget(self.placeholder)
-        source_form = QFormLayout()
-        source_form.addRow("镜像来源", self.source_combo)
-        image_layout.addLayout(source_form)
-        image_layout.addWidget(self.source_stack)
-        self.source_hint = QLabel()
-        self.source_hint.setWordWrap(True)
-        image_layout.addWidget(self.source_hint)
-        source_btns = QHBoxLayout()
-        source_btns.addWidget(check_ucm_btn)
-        source_btns.addStretch(1)
-        image_layout.addLayout(source_btns)
-        self._update_source_hint()
-        self._update_pull_command()
-
-        # ---------- 2. 上传安装包
-        build_box = QGroupBox("2. 安装包（仅在需要构建新 UCM 镜像时填写）")
+        # ---------- 2a. 基础镜像（构建的输入配置；运行时探测用于安装包匹配提示）
+        base_box = QGroupBox("基础镜像（构建底座）")
         self.runtime_label = QLabel("基础镜像运行时：选择镜像后自动检测")
         self.runtime_label.setProperty("role", "hint")
         self.runtime_label.setWordWrap(True)
+        base_layout = QVBoxLayout(base_box)
+        source_form = QFormLayout()
+        source_form.addRow("镜像来源", self.source_combo)
+        base_layout.addLayout(source_form)
+        base_layout.addWidget(self.source_stack)
+        self.source_hint = QLabel()
+        self.source_hint.setWordWrap(True)
+        base_layout.addWidget(self.source_hint)
+        base_layout.addWidget(self.runtime_label)
+        self._update_source_hint()
+        self._update_pull_command()
+
+        # ---------- 2b. 安装包（常驻；仅构建新 UCM 镜像时才需要填写）
+        self.build_box = QGroupBox("安装包（仅构建新 UCM 镜像时填写）")
         self.wrapt_whl_edit = QLineEdit()
         self.ucm_whl_edit = QLineEdit()
         self.toolkit_edit = QLineEdit()
@@ -207,6 +221,7 @@ class ImagePage(QWidget):
         self.toolkit_fb = QLabel("")
         for fb in (self.wrapt_fb, self.ucm_fb, self.toolkit_fb):
             fb.setProperty("role", "hint")
+            fb.setVisible(False)   # 未填写路径时隐藏，避免空行留白
         self.wrapt_whl_edit.textChanged.connect(
             lambda t: self._update_whl_feedback(self.wrapt_fb, t, "wrapt"))
         self.ucm_whl_edit.textChanged.connect(
@@ -217,8 +232,7 @@ class ImagePage(QWidget):
 
         self.image_combo.currentTextChanged.connect(self._on_base_image_changed)
 
-        form = QFormLayout(build_box)
-        form.addRow("基础镜像运行时", self.runtime_label)
+        form = QFormLayout(self.build_box)
         row_w = QHBoxLayout()
         row_w.addWidget(self.wrapt_whl_edit, 1)
         row_w.addWidget(wrapt_btn)
@@ -229,17 +243,17 @@ class ImagePage(QWidget):
         row_t.addWidget(self.toolkit_edit, 1)
         row_t.addWidget(toolkit_btn)
         form.addRow("wrapt whl 包*", row_w)
-        form.addRow("", self.wrapt_fb)
-        form.addRow("", self.wrapt_dl_hint)
+        form.addRow(self.wrapt_fb)
+        form.addRow(self.wrapt_dl_hint)
         form.addRow("UCM whl 包*", row_u)
-        form.addRow("", self.ucm_fb)
-        form.addRow("", self.ucm_dl_hint)
+        form.addRow(self.ucm_fb)
+        form.addRow(self.ucm_dl_hint)
         form.addRow("ucm-toolkit whl 包（可选）", row_t)
-        form.addRow("", self.toolkit_fb)
-        form.addRow("", self.toolkit_dl_hint)
+        form.addRow(self.toolkit_fb)
+        form.addRow(self.toolkit_dl_hint)
 
-        # ---------- 3. 新镜像名
-        name_box = QGroupBox("3. 新镜像名")
+        # ---------- 3. 新镜像名与构建操作（仅「构建新 UCM 镜像」分支显示）
+        name_box = QGroupBox("新镜像名与构建")
         self.tag_edit = QLineEdit()
         self.tag_edit.setPlaceholderText("默认自动生成：<基础镜像名>:ucm-<UCM版本号>，可修改")
         self.tag_edit.textChanged.connect(self._on_tag_edited)
@@ -248,7 +262,7 @@ class ImagePage(QWidget):
         name_form.addRow("新镜像名", self.tag_edit)
         name_form.addRow("构建平台(ENV PLATFORM)", self.platform_label)
 
-        # ---------- 操作
+        # ---------- 构建操作
         self.match_label = QLabel("匹配校验：未校验（构建前会自动强制校验）")
         self.match_label.setProperty("role", "hint")
         self.match_label.setWordWrap(True)
@@ -257,38 +271,61 @@ class ImagePage(QWidget):
         build_btn.setProperty("accent", True)
         match_btn.clicked.connect(self._check_match)
         build_btn.clicked.connect(self._build)
+        build_btns = QHBoxLayout()
+        build_btns.addWidget(match_btn)
+        build_btns.addWidget(build_btn)
+        build_btns.addStretch(1)
+        build_area_layout = QVBoxLayout()
+        build_area_layout.setContentsMargins(0, 0, 0, 0)
+        build_area_layout.addWidget(base_box)
+        build_area_layout.addWidget(self.build_box)
+        build_area_layout.addWidget(name_box)
+        build_area_layout.addWidget(self.match_label)
+        build_area_layout.addLayout(build_btns)
+        self.build_area = QWidget()
+        self.build_area.setLayout(build_area_layout)
 
         self.hint = QLabel(
-            "若基础镜像已安装 UCM，无需填写安装包或构建：点「检查所选镜像 UCM」确认后直接进入步骤3。\n"
-            "仅在确需制作新 UCM 镜像时填写下方安装包；构建会执行：上传三个包 -> "
+            "进入本页会自动扫描服务器镜像并检查是否已安装 UCM：发现已含 UCM 的镜像时"
+            "本步骤可跳过，直接进入步骤3创建容器，无需填写安装包或构建；\n"
+            "未发现且确需制作新 UCM 镜像时，在下方选择基础镜像、填写安装包后构建："
             "生成 Dockerfile -> docker build -> 校验 UCM 安装。")
         self.hint.setWordWrap(True)
 
         self.panel = ParallelTaskPanel()
 
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(scan_box)
+        content_layout.addWidget(self.build_area)
+        content_layout.addWidget(self.hint)
+
+        # 内容区（上）/ 任务记录（下）可拖动分栏；任务记录常驻显示
+        self.splitter = QSplitter(Qt.Vertical)
+        self.splitter.addWidget(content)
+        self.splitter.addWidget(self.panel)
+        self.splitter.setStretchFactor(0, 7)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setChildrenCollapsible(False)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(image_box)
-        layout.addWidget(build_box)
-        layout.addWidget(name_box)
-        layout.addWidget(self.match_label)
-        btns = QHBoxLayout()
-        btns.addWidget(match_btn)
-        btns.addWidget(build_btn)
-        btns.addStretch(1)
-        layout.addLayout(btns)
-        layout.addWidget(self.hint)
-        layout.addWidget(self.panel, 2)
+        layout.addWidget(self.splitter)
+
+    def _set_scan_state(self, text: str, color: str) -> None:
+        self.scan_state_label.setText(text)
+        self.scan_state_label.setStyleSheet(f"color:{color};")
 
     # ------------------------------------------------------------ 初始化
     def on_enter(self) -> None:
-        """进入本页：加载服务器镜像列表（有缓存则回显）。"""
+        """进入本页：扫描服务器镜像并检查 UCM（有缓存则回显）。"""
         server = self.ctx.server
         self.placeholder.setVisible(server is None)
         self._update_platform_label()
         if server is None:
             return
         if self._loaded_sid != server.id:
-            self._refresh_images()
+            self._scan_images()
         else:
             self._apply_images()
 
@@ -372,7 +409,12 @@ class ImagePage(QWidget):
         self._updating_tag = False
 
     def _on_base_image_changed(self, ref: str) -> None:
-        """选择基础镜像后自动探测运行时，用于包选择提示与强校验。"""
+        """选择基础镜像后自动探测运行时并精确检查该镜像的 UCM 安装：
+
+        - 运行时 -> 安装包匹配建议与强校验；
+        - UCM 结果 -> 状态行引导（已装可直接用作 UCM 镜像，无需构建）。
+        扫描按名称快筛可能漏报，这里是用户显式选中镜像的精确兜底。
+        """
         self._image_runtime = None
         self._refresh_whl_feedback()
         server = self.ctx.server
@@ -381,6 +423,10 @@ class ImagePage(QWidget):
             self.runtime_label.setText(
                 "基础镜像运行时：选择服务器已有镜像后自动检测")
             return
+        cached_ucm = self._ucm_cache.get(ref)
+        if cached_ucm is not None:
+            # 扫描已精确检查过该镜像：立即应用结论（同步），不重复 SSH
+            self._apply_base_ucm_state(ref, cached_ucm)
         if ref in self._runtime_cache:
             self._show_runtime_info(ref, self._runtime_cache[ref])
             return
@@ -389,20 +435,42 @@ class ImagePage(QWidget):
         def fn():
             from ...core.ssh_client import SSHClient
             with SSHClient(server) as ssh:
-                return fetch_image_runtime_info(ssh, ref)
+                info = (self._runtime_cache.get(ref)
+                        or fetch_image_runtime_info(ssh, ref))
+                ucm = cached_ucm or DockerManager(ssh).image_ucm_info(ref)
+                return info, ucm
 
-        def on_done(info, error):
+        def on_done(result, error):
             if combo_ref(self.image_combo) != ref:
                 return
-            if error is not None or info is None:
+            if error is not None:
                 self.runtime_label.setText(
-                    f"基础镜像运行时：检测失败（{error or '未知错误'}）。"
+                    f"基础镜像运行时：检测失败（{error}）。"
                     "构建前仍会尝试校验，请手动核对 whl。")
                 return
+            info, ucm = result
             self._runtime_cache[ref] = info
+            if cached_ucm is None:
+                # 只有本次真正做了 UCM 检查才更新结论，避免覆盖扫描文案
+                self._ucm_cache[ref] = ucm
+                self._apply_base_ucm_state(ref, ucm)
             self._show_runtime_info(ref, info)
 
         self._run_quick(fn, on_done)
+
+    def _apply_base_ucm_state(self, ref: str, ucm: UCMInfo) -> None:
+        """底座检查结论（比全局扫描更贴近当前操作，覆盖显示）。"""
+        if ucm.installed:
+            if self.ctx.server is not None:
+                self.ctx.images[self.ctx.server.id] = ref
+            self._set_scan_state(
+                f"✓ 基础镜像 {ref} 已安装 UCM {ucm.version}——"
+                "无需构建，可直接进入步骤3使用；也可在下方按需构建新镜像",
+                "#16a34a")
+        else:
+            self._set_scan_state(
+                f"基础镜像 {ref} 未安装 UCM——如需使用，"
+                "请在下方填写安装包并构建", "#d97706")
 
     def _show_runtime_info(self, ref: str, info: ImageRuntimeInfo) -> None:
         self._image_runtime = info
@@ -465,11 +533,13 @@ class ImagePage(QWidget):
 
     def _update_whl_feedback(self, label: QLabel, text: str,
                              expected_distribution: str) -> None:
-        """whl 路径即时反馈：文件有效性 + 基础镜像运行时匹配。"""
+        """whl 路径即时反馈：文件有效性 + 基础镜像运行时匹配（空路径时隐藏行）。"""
         path = text.strip()
         if not path:
             label.setText("")
+            label.setVisible(False)
             return
+        label.setVisible(True)
         name = os.path.basename(path)
         if not os.path.isfile(path):
             label.setText(f"⚠ 文件不存在: {name}")
@@ -541,14 +611,16 @@ class ImagePage(QWidget):
         task.start()
 
     # ------------------------------------------------------------ 镜像操作
-    def _refresh_images(self) -> None:
+    def _scan_images(self) -> None:
+        """扫描服务器镜像并检查疑似 UCM 镜像，状态行给出「跳过/构建」结论。"""
         server = self.ctx.server
         if server is None:
-            QMessageBox.information(self, "提示", "请先在步骤1勾选要登录的服务器")
+            QMessageBox.information(self, "提示", "请先在步骤1点选要登录的服务器")
             return
+        self._set_scan_state("镜像 UCM：正在扫描服务器镜像 ...", "#64748b")
 
         def fn(ssh, tctx):
-            tctx.progress(40, "获取镜像列表")
+            tctx.progress(30, "获取镜像列表")
             dm = DockerManager(ssh)
             if not dm.check_docker():
                 raise RuntimeError("docker 不可用")
@@ -558,16 +630,47 @@ class ImagePage(QWidget):
             for im in images:
                 mark = " [疑似UCM]" if "ucm" in im.ref.lower() else ""
                 tctx.log(f"  {im.ref}    {im.size}{mark}")
-            tctx.progress(100, f"{len(images)} 个镜像")
+            suspects = [im.ref for im in images if "ucm" in im.ref.lower()]
+            installed = []
+            if suspects:
+                tctx.progress(60, f"检查 {len(suspects)} 个疑似 UCM 镜像")
+                for ref in suspects:
+                    ucm = dm.image_ucm_info(ref)
+                    self._ucm_cache[ref] = ucm  # 底座选中时直接复用，不再 SSH
+                    tctx.log(f"UCM 检查 {ref}: {ucm}")
+                    if ucm.installed:
+                        installed.append((ref, ucm))
+                        break   # 找到一个即可下结论，停止检查剩余疑似镜像
+            self._scan_installed = installed
 
         def on_finished(all_ok: bool) -> None:
-            if all_ok:
-                self._loaded_sid = server.id
-                self._apply_images()
+            if not all_ok:
+                # 扫描失败不清空已知镜像（例如导入/拉取后复扫失败的场景）
+                if self._images:
+                    self._apply_images()
+                else:
+                    fill_image_combo(self.image_combo, [])  # 加载失败占位提示
+                self._set_scan_state(
+                    "✗ 扫描失败：无法获取服务器镜像（详见任务记录）——"
+                    "如需使用 UCM，仍可在下方构建", "#d97706")
+                return
+            self._loaded_sid = server.id
+            self._apply_images()
+            installed = self._scan_installed or []
+            if installed:
+                ref = installed[0][0]
+                self.ctx.images[server.id] = ref
+                self._set_scan_state(
+                    f"✓ 扫描完成：发现已有 UCM 镜像 {ref}——"
+                    "本步骤可跳过，直接进入步骤3创建容器；也可在下方按需构建新镜像",
+                    "#16a34a")
             else:
-                fill_image_combo(self.image_combo, [])  # 显示加载失败占位提示
+                self._set_scan_state(
+                    "✗ 扫描完成：找不到 UCM 镜像——"
+                    "如需使用 UCM，请在下方选择基础镜像并构建", "#d97706")
 
-        self.panel.run_tasks([(server, fn)], "刷新镜像列表", on_finished=on_finished)
+        self.panel.run_tasks([(server, fn)], "扫描镜像并检查 UCM",
+                             on_finished=on_finished)
 
     def _apply_images(self) -> None:
         server = self.ctx.server
@@ -604,6 +707,7 @@ class ImagePage(QWidget):
             if all_ok:
                 self._apply_images()
                 self._select_source(0)
+                self._scan_images()
                 QMessageBox.information(
                     self, "完成", "镜像已导入服务器，并已切换为“服务器已有镜像”。")
 
@@ -663,42 +767,16 @@ class ImagePage(QWidget):
                 return
             self._apply_images()
             self._select_source(0)
+            self._scan_images()
             self._pull_command_dirty = False
             QMessageBox.information(
                 self, "完成",
                 f"镜像 {ref} 已在目标服务器上拉取完成。\n"
-                "已切换为“服务器已有镜像”，可继续检查 UCM。")
+                "已切换为“服务器已有镜像”，可将其选为构建底座。")
 
         self.panel.run_tasks(
             [(server, fn)], f"服务器拉取镜像（{server.name}）",
             on_finished=on_finished)
-
-    def _check_ucm(self) -> None:
-        server = self.ctx.server
-        if server is None:
-            QMessageBox.information(self, "提示", "请先在步骤1勾选要登录的服务器")
-            return
-        base = self._selected_base()
-        if base is None:
-            return
-
-        def fn(ssh, tctx):
-            tctx.progress(50, f"检查 {base}")
-            ucm = DockerManager(ssh).image_ucm_info(base)
-            tctx.log(f"{base}: {ucm}")
-            tctx.progress(100, str(ucm))
-            if ucm.installed:
-                self.ctx.images[server.id] = base
-
-        def on_finished(all_ok: bool) -> None:
-            if all_ok and server.id in self.ctx.images:
-                QMessageBox.information(
-                    self, "已记录",
-                    f"镜像 {base} 已安装 UCM，已记录为本服务器使用的镜像，"
-                    "可直接进入步骤3创建容器。")
-
-        self.panel.run_tasks([(server, fn)], "检查镜像 UCM",
-                             on_finished=on_finished)
 
     # ------------------------------------------------------------ 校验/构建
     def _local_args(self):
@@ -798,6 +876,7 @@ class ImagePage(QWidget):
             if not all_ok:
                 return
             self._apply_images()
+            self._scan_images()
             QMessageBox.information(
                 self, "构建完成",
                 f"镜像构建完成: {tag}\n已记录为本服务器使用的 UCM 镜像，"

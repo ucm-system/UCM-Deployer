@@ -4,19 +4,20 @@
 
 :book: **[在线使用文档（含界面截图）](https://ucm-system.github.io/UCM-Deployer/)**
 
-面向 vLLM / vLLM-Ascend / SGLang 运行环境（Ascend NPU / NVIDIA GPU），把 UCM 安装与环境预检简化为五个向导步骤：
+面向 vLLM / vLLM-Ascend / SGLang 运行环境（Ascend NPU / NVIDIA GPU），把 UCM 安装、环境预检与服务部署简化为向导步骤：
 
 ```
-① 服务器管理 → ② 镜像准备 → ③ 容器准备 → ④ 环境预检 → ⑤ 批量部署
+① 服务器管理 → ② 镜像准备 → ③ 容器准备 → ④ 环境预检 → ⑤ 服务部署（另有（可选）批量部署面向多台服务器）
 ```
 
 - **步骤1 服务器管理**：SSH 登录信息本地加密保存/复用；单选登录一台服务器；`npu-smi`/`nvidia-smi` 设备探测（型号/卡数/CPU 架构）
 - **步骤2 镜像准备**：通过单一“镜像来源”选择器复用服务器已有镜像、离线导入本地 tar 包，或输入镜像仓库地址（如 `quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler`）由**目标服务器**直接 `docker pull`（本地无需 Docker Desktop）；已含 UCM 的镜像可直接复用并跳过构建；确需构建时上传 wrapt/UCM/ucm-toolkit whl，构建前自动校验设备平台与架构
-- **步骤3 容器准备**：选 UCM 镜像（**选择时自动校验**镜像内 UCM）；自动探测宿主机实际存在的 Ascend 设备节点与驱动/工具挂载，兼容 Ascend 950PR/A5（缺失 `/dev/devmm_svm` 时不再生成该参数，存在 `/dev/ummu` 或 `/dev/uburma` 时自动添加 `--privileged=true`）；GPU 使用 `--runtime nvidia --gpus all -p 8000:8000`；KV Cache / 模型只读 / 自定义挂载；docker run 命令**可编辑**后执行；已有 UCM 容器可跳过创建
-- **步骤4 环境预检**：**显式选择目标容器**（刷新 `docker ps -a` 后选择已有容器或输入容器名）；在所选容器内运行 `ucm-toolkit run precheck`（驱动/内核/共享内存/AIO 检查 + **可选挂载目录带宽测试**）；当 toolkit 无法识别 UCM 平台变体或 Ascend 驱动版本时，自动用 pip 元数据、`version.info`、`npu-smi`、`nvidia-smi` 多来源补齐并标注来源；**预检参数可配置**；结果**表格+详情区展示**（PASS/WARN/FAIL/INFO 着色、中文名与排查建议）
-- **步骤5 批量部署**：在一台服务器制作好镜像后，**勾选多台目标服务器**批量执行「镜像分发 → 容器创建 → 环境预检」；镜像分发支持 **tar 包中转**（源服务器 `docker save | gzip` 导出 → 本机中转 → 各目标 `docker load`）与**镜像仓库拉取**两种方式，目标已有同名镜像可自动跳过；每台服务器独立进度条 + 独立日志页签，按设备类型（Ascend/NVIDIA）自动适配容器参数；**部署数据模板（JSON）** 涵盖服务器登录信息、镜像来源、容器创建参数与预检参数，支持导出/导入，一次填写多机复用
+- **步骤3 容器准备**：选 UCM 镜像（**选择时自动校验**镜像内 UCM）；自动探测宿主机实际存在的 Ascend 设备节点与驱动/工具挂载，兼容 Ascend 950PR/A5（缺失 `/dev/devmm_svm` 时不再生成该参数，存在 `/dev/ummu` 或 `/dev/uburma` 时自动添加 `--privileged=true`）；GPU 使用 `--runtime nvidia --gpus all -p 8000:8000`；**统一挂载表**（KV Cache 行同路径锁定 / 模型预置行 / 自定义挂载，选中行可校验是否位于同一文件系统）；docker run 命令**可编辑**后执行；已有 UCM 容器可跳过创建
+- **步骤4 环境预检**：**显式选择目标容器**（刷新 `docker ps -a` 后选择已有容器或输入容器名）；在所选容器内运行 `ucm-toolkit run precheck`（驱动/内核/共享内存/AIO/**SMMU** 检查 + **可选挂载目录带宽测试**）；当 toolkit 无法识别 UCM 平台变体或 Ascend 驱动版本时，自动用 pip 元数据、`version.info`、`npu-smi`、`nvidia-smi` 多来源补齐并标注来源；**预检参数可配置**；结果**表格+详情区展示**（PASS/WARN/FAIL/INFO 着色、中文名与排查建议）
+- **步骤5 服务部署**：**操作指引页**（三模块，阅读顺序=操作顺序）——① UCM 配置文件：给出参考默认配置（`UcmPipelineStore` / `Cache|Posix` 存储）与参数说明**可点击网址**（华为官方文档）；② 推理服务拉起命令：给出容器内执行的命令模板与注意事项（需先导出 `ENABLE_UCM_PATCH=1`、`VLLM_CPU_AFFINITY=1` 环境变量，命令附加 `--kv-transfer-config` 接入 UCMConnector，`UCM_CONFIG_FILE` 指向 UCM 配置文件路径，可自定义）；③ 验证连通性：给出服务就绪后 curl 验证模板（`/health`、`/v1/models`、`/v1/chat/completions` 完整示例）；三块内容均**可复制**且右下角可**拖动调整高度**
+- **（可选）批量部署**：面向**多台服务器**场景——在一台服务器制作好镜像后，勾选多台目标批量执行「镜像分发 → 容器创建 → 环境预检」；镜像分发支持 **tar 包中转**（源服务器 `docker save | gzip` 导出 → 本机中转 → 各目标 `docker load`）与**镜像仓库拉取**两种方式，目标已有同名镜像可自动跳过；目标服务器列表来自步骤1「服务器管理」；每台服务器独立进度条 + 独立日志页签，按设备类型（Ascend/NVIDIA）自动适配容器参数；**部署数据模板（JSON）** 涵盖服务器登录信息、镜像来源、容器创建参数与预检参数，支持导出/导入，一次填写多机复用
 - **工具菜单**：清理指定容器（`docker ps -a` 勾选删除）/ 清理指定镜像（`docker images` 勾选删除），作用于当前登录的服务器
-- 步骤间**自由跳转**（前置条件在操作执行时拦截）；所有生成的命令**先展示、可编辑、再执行**；本工具负责 UCM 安装与环境预检，不负责启动或部署推理服务
+- 步骤间**自由跳转**（前置条件在操作执行时拦截）；所有生成的命令**先展示、可编辑、再执行**；全部步骤页面在窗口过小时**内部滚动**，窗口可自由缩放
 
 ## 快速开始
 
@@ -59,7 +60,7 @@ git tag v0.2.0 && git push origin v0.2.0
 
 | 层级 | 手段 | 覆盖 |
 |---|---|---|
-| 单元测试 | `tests/`（FakeSSH 脚本化 paramiko 替身） | SSH/加密/注册表/设备解析/docker 解析/Dockerfile/命令生成/匹配校验/批量部署/部署模板 等 210 项 |
+| 单元测试 | `tests/`（FakeSSH 脚本化 paramiko 替身） | SSH/加密/注册表/设备解析/docker 解析/Dockerfile/命令生成/匹配校验/服务部署/SMMU/批量部署/部署模板 等 244 项 |
 | GUI | offscreen 冒烟 | 各页面实例化、导航守卫、单选/多选、镜像筛选、下载链接、whl 反馈、批量执行、模板导入导出、像素采样断言界面无黑块 |
 | 产物 | `exe --smoke` | 打包后程序自检 |
 
@@ -83,13 +84,14 @@ UCM-Deployer/
 │   │   ├── docker_manager.py     # docker 操作
 │   │   ├── image_builder.py      # 匹配校验 + 镜像构建
 │   │   ├── container_manager.py  # docker run 生成/执行
+│   │   ├── service_deploy.py     # 服务部署流水线（写 UCM 配置 + 拉起推理服务）
 │   │   └── batch_deploy.py       # 批量部署 + 部署数据模板
-│   ├── gui/                      # PySide6 五步向导
+│   ├── gui/                      # PySide6 向导（5 步骤 + 可选批量部署）
 │   │   ├── widgets/              # 五个步骤页面 + 通用组件
 │   │   ├── main_window.py        # 主窗口/导航守卫/状态栏
 │   │   └── theme.py              # QSS 主题 + 图标
 │   └── utils/                    # 日志/路径
-├── tests/                        # 210 项测试（FakeSSH + GUI 冒烟）
+├── tests/                        # 244 项测试（FakeSSH + GUI 冒烟）
 ├── docs/                         # 用户手册 / 架构文档
 ├── scripts/build_exe.ps1         # 打包脚本
 └── ucm_deployer.spec             # PyInstaller 配置

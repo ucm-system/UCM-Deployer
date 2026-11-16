@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""步骤5：批量部署 —— 在一台源服务器制作镜像后，向多台目标服务器
-分发镜像、创建容器并执行环境预检。
+"""可选：批量部署 —— 在一台源服务器制作镜像后，向多台目标服务器
+分发镜像、创建容器并执行环境预检。仅多台服务器场景需要本功能，
+单台服务器走步骤5（服务部署）在目标容器内一键拉起推理服务。
 
 - 镜像分发：镜像包中转（源服务器 docker save → 本机 → 目标 docker load）
   或镜像仓库（各目标直接 docker pull）；目标已有同名镜像可跳过；
@@ -31,7 +32,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -62,7 +62,7 @@ from ...core.docker_manager import DockerManager, validate_image_ref
 from ...core.models import ServerInfo, VolumeMount
 from ...core.shell import shq
 from ..state import AppContext
-from .common import ParallelTaskPanel
+from .common import ParallelTaskPanel, attach_resize_grip
 
 
 class BatchPage(QWidget):
@@ -78,15 +78,12 @@ class BatchPage(QWidget):
         self._local_tar = ""
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        layout.setSpacing(10)              # 与步骤3/4 一致：模块间顺序感
         layout.addWidget(self._build_template_row())
         layout.addWidget(self._build_source_box())
-        middle = QHBoxLayout()
-        middle.setSpacing(8)
-        middle.addWidget(self._build_targets_box(), 2)
-        middle.addWidget(self._build_config_box(), 3)
-        layout.addLayout(middle, 1)
-        layout.addWidget(self._build_run_box())
+        layout.addWidget(self._build_targets_box(), 1)
+        layout.addWidget(self._build_config_box(), 1)
+        layout.addWidget(self._build_run_box(), 1)
 
         self._update_target_count()
 
@@ -144,10 +141,13 @@ class BatchPage(QWidget):
         return box
 
     def _build_targets_box(self) -> QGroupBox:
-        box = QGroupBox("2. 目标服务器（勾选多台）")
+        box = QGroupBox("2. 目标服务器（来自步骤1「服务器管理」，勾选多台）")
         select_all_btn = QPushButton("全选")
         clear_btn = QPushButton("清空")
         refresh_btn = QPushButton("🔄 刷新")
+        refresh_btn.setToolTip(
+            "从步骤1「服务器管理」重新读取服务器列表（本页不单独维护服务器，\n"
+            "增删改请回步骤1 操作后点此同步）")
         select_all_btn.clicked.connect(lambda: self._set_all_targets(True))
         clear_btn.clicked.connect(lambda: self._set_all_targets(False))
         refresh_btn.clicked.connect(self.refresh_servers)
@@ -164,10 +164,14 @@ class BatchPage(QWidget):
         self.target_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.target_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.target_table.setAlternatingRowColors(True)
+        self.target_table.setMaximumHeight(126)
         self.target_table.itemChanged.connect(self._on_target_item_changed)
 
         self.target_count_label = QLabel("已选 0 台")
         self.target_count_label.setProperty("role", "hint")
+        source_hint = QLabel(
+            "服务器列表与步骤1「服务器管理」完全一致：在步骤1 新增/编辑后点「🔄 刷新」即可同步")
+        source_hint.setProperty("role", "hint")
 
         btns = QHBoxLayout()
         for b in (select_all_btn, clear_btn, refresh_btn):
@@ -177,7 +181,11 @@ class BatchPage(QWidget):
         lay.setSpacing(4)
         lay.addLayout(btns)
         lay.addWidget(self.target_table, 1)
-        lay.addWidget(self.target_count_label)
+        count_row = QHBoxLayout()
+        count_row.addWidget(self.target_count_label)
+        count_row.addSpacing(12)
+        count_row.addWidget(source_hint, 1)
+        lay.addLayout(count_row)
         return box
 
     def _build_config_box(self) -> QGroupBox:
@@ -192,9 +200,9 @@ class BatchPage(QWidget):
     def _build_container_tab(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setSpacing(6)
+        lay.setSpacing(4)
 
-        # 基本参数行
+        # 基本参数行（标签改人话 + tooltip，与步骤3 一致）
         self.name_edit = QLineEdit("ucm-vllm")
         self.shm_edit = QLineEdit("512g")
         self.net_edit = QLineEdit("host")
@@ -202,89 +210,76 @@ class BatchPage(QWidget):
         self.shm_edit.setFixedWidth(80)
         self.net_edit.setFixedWidth(90)
         self.ports_edit.setFixedWidth(130)
-        self.shm_edit.setToolTip("docker run --shm-size")
-        self.net_edit.setToolTip("docker run --net（Ascend 容器使用；NVIDIA 使用端口映射）")
-        self.ports_edit.setToolTip("docker run -p 端口映射（NVIDIA 容器使用，逗号分隔多个）")
+        self.name_edit.setToolTip("docker 容器名（--name）；步骤4 按此名找到容器")
+        self.shm_edit.setToolTip("容器共享内存（--shm-size）；vLLM 需要大共享内存，默认 512g")
+        self.net_edit.setToolTip("host = 共享宿主机网络（Ascend 推荐）；NVIDIA 容器用端口映射")
+        self.ports_edit.setToolTip("docker -p 端口映射（NVIDIA 容器使用，逗号分隔多个）")
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("容器名"))
         row1.addWidget(self.name_edit)
-        row1.addWidget(QLabel("shm"))
+        row1.addWidget(QLabel("共享内存"))
         row1.addWidget(self.shm_edit)
-        row1.addWidget(QLabel("net"))
+        row1.addWidget(QLabel("网络"))
         row1.addWidget(self.net_edit)
-        row1.addWidget(QLabel("-p"))
+        row1.addWidget(QLabel("端口映射"))
         row1.addWidget(self.ports_edit)
         row1.addStretch(1)
         lay.addLayout(row1)
 
-        # KV Cache 目录
-        kv_label = QLabel("KV Cache 目录（宿主机绝对路径，原样映射进容器）")
-        kv_label.setProperty("role", "hint")
-        self.kv_list = QListWidget()
-        self.kv_list.setMaximumHeight(64)
-        self.kv_list.setToolTip("每行一个目录；将 -v 目录:目录 挂载进容器")
-        self.kv_edit = QLineEdit()
-        self.kv_edit.setPlaceholderText("/mnt/kvcache...")
-        kv_add_btn = QPushButton("➕ 添加")
-        kv_del_btn = QPushButton("🗑 移除选中")
-        kv_add_btn.clicked.connect(self._kv_add)
-        kv_del_btn.clicked.connect(self._kv_del)
-        kv_row = QHBoxLayout()
-        kv_row.addWidget(self.kv_edit, 1)
-        kv_row.addWidget(kv_add_btn)
-        kv_row.addWidget(kv_del_btn)
-        lay.addWidget(kv_label)
-        lay.addWidget(self.kv_list)
-        lay.addLayout(kv_row)
+        # 统一挂载表（与步骤3 一致）：KV Cache / 模型 / 自定义，一套按钮
+        self.mount_type = QComboBox()
+        self.mount_type.addItems(["KV Cache", "模型", "自定义"])
+        self.mount_type.setToolTip(
+            "KV Cache：挂载到容器内相同路径（多目录须位于同一文件系统）\n"
+            "模型：模型文件目录（默认只读，表中最多一行）\n"
+            "自定义：其他任意目录映射")
+        self.mount_host_edit = QLineEdit()
+        self.mount_host_edit.setPlaceholderText("宿主机绝对路径，如 /mnt/kvcache")
+        self.mount_host_edit.textChanged.connect(self._sync_mount_container)
+        self.mount_container_edit = QLineEdit()
+        self.mount_container_edit.setPlaceholderText("容器内路径")
+        mount_add_btn = QPushButton("➕ 添加")
+        mount_add_btn.clicked.connect(self._mount_add)
 
-        # 模型挂载 + 额外挂载
-        self.model_host_edit = QLineEdit()
-        self.model_host_edit.setPlaceholderText("/data/models/...（留空则不挂载）")
-        self.model_container_edit = QLineEdit("/models")
-        self.model_container_edit.setFixedWidth(150)
-        self.model_ro_check = QCheckBox("只读")
-        self.model_ro_check.setChecked(True)
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("模型"))
-        model_row.addWidget(self.model_host_edit, 1)
-        model_row.addWidget(QLabel("→"))
-        model_row.addWidget(self.model_container_edit)
-        model_row.addWidget(self.model_ro_check)
-        lay.addLayout(model_row)
+        self.mount_table = QTableWidget(0, 4)
+        self.mount_table.setHorizontalHeaderLabels(
+            ["类型", "宿主机路径", "容器内路径", "只读"])
+        self.mount_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.mount_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.mount_table.verticalHeader().setVisible(False)
+        self.mount_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.mount_table.setMinimumHeight(150)
+        self.mount_table.setToolTip(
+            "所有挂载类型共用本表：上方输入后「➕ 添加」，选中行「🗑 移除」。\n"
+            "KV Cache 行容器内路径自动与宿主机相同（锁定不可改）。\n"
+            "「模型」行默认预置，可直接编辑；删除该行即不挂载模型。")
+        self._add_mount_row("模型", "", "/models", True)   # 预置模型行（空路径=不挂载）
+        mount_del_btn = QPushButton("🗑 移除选中")
+        mount_del_btn.clicked.connect(self._mount_del)
 
-        extra_label = QLabel("额外挂载（宿主机路径 → 容器内路径，支持多行）")
-        extra_label.setProperty("role", "hint")
-        self.extra_table = QTableWidget(0, 3)
-        self.extra_table.setHorizontalHeaderLabels(["宿主机路径", "容器内路径", "只读"])
-        self.extra_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.extra_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.extra_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.extra_table.verticalHeader().setVisible(False)
-        self.extra_table.setMaximumHeight(88)
-        ex_add_btn = QPushButton("➕ 添加挂载")
-        ex_del_btn = QPushButton("🗑 删除选中")
-        ex_add_btn.clicked.connect(self._extra_add)
-        ex_del_btn.clicked.connect(self._extra_del)
-        ex_row = QHBoxLayout()
-        ex_row.addWidget(ex_add_btn)
-        ex_row.addWidget(ex_del_btn)
-        ex_row.addStretch(1)
-        lay.addWidget(extra_label)
-        lay.addWidget(self.extra_table)
-        lay.addLayout(ex_row)
+        add_row = QHBoxLayout()
+        add_row.addWidget(QLabel("类型"))
+        add_row.addWidget(self.mount_type)
+        add_row.addWidget(self.mount_host_edit, 1)
+        add_row.addWidget(QLabel("→ 容器内"))
+        add_row.addWidget(self.mount_container_edit, 1)
+        add_row.addWidget(mount_add_btn)
+        add_row.addWidget(mount_del_btn)
+        lay.addLayout(add_row)
+        lay.addWidget(self.mount_table)
 
         # 附加参数
         extra_args_label = QLabel("附加 docker run 参数（每行一项，追加到命令末尾）")
         extra_args_label.setProperty("role", "hint")
         self.extra_args_edit = QPlainTextEdit()
-        self.extra_args_edit.setFixedHeight(40)
+        self.extra_args_edit.setFixedHeight(28)
+        attach_resize_grip(self.extra_args_edit)   # 右下角拖动调整高度
         self.extra_args_edit.setPlaceholderText("--ulimit nofile=65535:65535")
         font = QFont("Consolas")
         font.setStyleHint(QFont.Monospace)
         self.extra_args_edit.setFont(font)
         lay.addWidget(extra_args_label)
         lay.addWidget(self.extra_args_edit)
-        lay.addStretch(1)
         return page
 
     def _build_precheck_tab(self) -> QWidget:
@@ -325,7 +320,8 @@ class BatchPage(QWidget):
         self.custom_cfg_edit.setPlaceholderText(
             '{\n  "bandwidth": {"workers": 8}\n}\n（JSON，只需写要覆盖的键）')
         self.custom_cfg_edit.setFont(QFont("Consolas"))
-        self.custom_cfg_edit.setFixedHeight(110)
+        self.custom_cfg_edit.setFixedHeight(84)
+        attach_resize_grip(self.custom_cfg_edit)   # 右下角拖动调整高度
         self.custom_cfg_edit.textChanged.connect(self._validate_precheck_json)
         lay.addWidget(self.custom_cfg_edit)
         lay.addStretch(1)
@@ -388,6 +384,15 @@ class BatchPage(QWidget):
 
         self.target_table.itemChanged.disconnect(self._on_target_item_changed)
         self.target_table.setRowCount(0)
+        if not servers:
+            # 空状态引导：与步骤1 的关系一目了然
+            self.target_table.setRowCount(1)
+            self.target_table.setSpan(0, 0, 1, 5)
+            hint_item = QTableWidgetItem(
+                "尚未添加服务器——请回步骤1「服务器管理」添加，然后点「🔄 刷新」同步")
+            hint_item.setFlags(Qt.ItemIsEnabled)
+            hint_item.setForeground(Qt.gray)
+            self.target_table.setItem(0, 0, hint_item)
         for server in servers:
             row = self.target_table.rowCount()
             self.target_table.insertRow(row)
@@ -477,58 +482,80 @@ class BatchPage(QWidget):
                 return i
         return -1
 
-    # ------------------------------------------------------------ 挂载编辑
-    def _kv_add(self) -> None:
-        path = self.kv_edit.text().strip()
-        if not path.startswith("/"):
-            QMessageBox.warning(self, "参数错误", "请输入以 / 开头的绝对路径")
+    # ------------------------------------------------------------ 挂载编辑（统一挂载表，与步骤3 一致）
+    def _add_mount_row(self, mtype: str, host: str, cont: str,
+                       readonly: bool = False) -> None:
+        row = self.mount_table.rowCount()
+        self.mount_table.insertRow(row)
+        t_item = QTableWidgetItem(mtype)
+        t_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.mount_table.setItem(row, 0, t_item)
+        self.mount_table.setItem(row, 1, QTableWidgetItem(host))
+        cont_item = QTableWidgetItem(cont)
+        if mtype == "KV Cache":
+            # KV Cache 行：容器内路径与宿主机相同，锁定不可编辑
+            cont_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.mount_table.setItem(row, 2, cont_item)
+        ro_item = QTableWidgetItem()
+        ro_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        ro_item.setCheckState(Qt.Checked if readonly else Qt.Unchecked)
+        self.mount_table.setItem(row, 3, ro_item)
+
+    def _sync_mount_container(self, text: str) -> None:
+        if self.mount_type.currentIndex() == 0:      # KV Cache：同路径
+            self.mount_container_edit.setText(text.strip())
+
+    def _mount_add(self) -> None:
+        mtype = self.mount_type.currentText()
+        host = self.mount_host_edit.text().strip()
+        if not host.startswith("/"):
+            QMessageBox.warning(self, "参数错误", "请输入以 / 开头的宿主机绝对路径")
             return
-        if path not in [self.kv_list.item(i).text()
-                        for i in range(self.kv_list.count())]:
-            self.kv_list.addItem(path)
-        self.kv_edit.clear()
+        if mtype == "模型":
+            for row in range(self.mount_table.rowCount()):
+                t_item = self.mount_table.item(row, 0)
+                if (t_item is not None and t_item.text() == "模型"
+                        and (self.mount_table.item(row, 1).text() or "").strip()):
+                    QMessageBox.warning(self, "参数错误",
+                                        "「模型」挂载最多一行（直接编辑预置行即可）")
+                    return
+        cont = self.mount_container_edit.text().strip()
+        if mtype == "KV Cache":
+            cont = host
+        self._add_mount_row(mtype, host, cont, mtype != "KV Cache")
+        self.mount_host_edit.clear()
+        self.mount_container_edit.clear()
+        self.mount_table.scrollToBottom()   # 新行立即可见
 
-    def _kv_del(self) -> None:
-        row = self.kv_list.currentRow()
+    def _mount_del(self) -> None:
+        row = self.mount_table.currentRow()
         if row >= 0:
-            self.kv_list.takeItem(row)
-
-    def _extra_add(self) -> None:
-        row = self.extra_table.rowCount()
-        self.extra_table.insertRow(row)
-        self.extra_table.setItem(row, 0, QTableWidgetItem("/host/path"))
-        self.extra_table.setItem(row, 1, QTableWidgetItem("/container/path"))
-        ro = QTableWidgetItem()
-        ro.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-        ro.setCheckState(Qt.Unchecked)
-        self.extra_table.setItem(row, 2, ro)
-
-    def _extra_del(self) -> None:
-        row = self.extra_table.currentRow()
-        if row >= 0:
-            self.extra_table.removeRow(row)
+            self.mount_table.removeRow(row)
 
     # ------------------------------------------------------------ 配置收集
     def _build_container_template(self) -> BatchContainerConfig:
         ports = [p.strip() for p in re.split(r"[,，\s]+", self.ports_edit.text())
                  if p.strip()]
-        kv_dirs = [self.kv_list.item(i).text().strip()
-                   for i in range(self.kv_list.count())]
+        kv_dirs: List[str] = []
         model_mount = None
-        if self.model_host_edit.text().strip():
-            model_mount = VolumeMount(
-                self.model_host_edit.text().strip(),
-                self.model_container_edit.text().strip() or "/models",
-                self.model_ro_check.isChecked())
         extra_mounts: List[VolumeMount] = []
-        for row in range(self.extra_table.rowCount()):
-            host = (self.extra_table.item(row, 0).text()
-                    if self.extra_table.item(row, 0) else "").strip()
-            cont = (self.extra_table.item(row, 1).text()
-                    if self.extra_table.item(row, 1) else "").strip()
-            ro_item = self.extra_table.item(row, 2)
+        for row in range(self.mount_table.rowCount()):
+            t_item = self.mount_table.item(row, 0)
+            mtype = t_item.text() if t_item is not None else ""
+            host = (self.mount_table.item(row, 1).text()
+                    if self.mount_table.item(row, 1) else "").strip()
+            cont = (self.mount_table.item(row, 2).text()
+                    if self.mount_table.item(row, 2) else "").strip()
+            ro_item = self.mount_table.item(row, 3)
             ro = ro_item is not None and ro_item.checkState() == Qt.Checked
-            if host and cont:
+            if not host:
+                continue                     # 预置模型行空路径 = 不挂载模型
+            if mtype == "KV Cache":
+                kv_dirs.append(host)
+            elif mtype == "模型":
+                if model_mount is None:
+                    model_mount = VolumeMount(host, cont or "/models", ro)
+            elif cont:
                 extra_mounts.append(VolumeMount(host, cont, ro))
         cfg = BatchContainerConfig(
             name=self.name_edit.text().strip() or "ucm-vllm",
@@ -666,27 +693,18 @@ class BatchPage(QWidget):
         self.shm_edit.setText(cfg.shm_size)
         self.net_edit.setText(cfg.network)
         self.ports_edit.setText(" ".join(cfg.ports))
-        self.kv_list.clear()
+        # 统一挂载表回填：先预置空模型行，再按类型逐行填入
+        self.mount_table.setRowCount(0)
+        self._add_mount_row("模型", "", "/models", True)
         for d in cfg.kv_cache_dirs:
-            self.kv_list.addItem(d)
+            self._add_mount_row("KV Cache", d, d, False)
         if cfg.model_mount is not None:
-            self.model_host_edit.setText(cfg.model_mount.host_path)
-            self.model_container_edit.setText(cfg.model_mount.container_path)
-            self.model_ro_check.setChecked(cfg.model_mount.readonly)
-        else:
-            self.model_host_edit.clear()
-            self.model_container_edit.setText("/models")
-            self.model_ro_check.setChecked(True)
-        self.extra_table.setRowCount(0)
+            self.mount_table.item(0, 1).setText(cfg.model_mount.host_path)
+            self.mount_table.item(0, 2).setText(cfg.model_mount.container_path)
+            self.mount_table.item(0, 3).setCheckState(
+                Qt.Checked if cfg.model_mount.readonly else Qt.Unchecked)
         for m in cfg.extra_mounts:
-            row = self.extra_table.rowCount()
-            self.extra_table.insertRow(row)
-            self.extra_table.setItem(row, 0, QTableWidgetItem(m.host_path))
-            self.extra_table.setItem(row, 1, QTableWidgetItem(m.container_path))
-            ro = QTableWidgetItem()
-            ro.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            ro.setCheckState(Qt.Checked if m.readonly else Qt.Unchecked)
-            self.extra_table.setItem(row, 2, ro)
+            self._add_mount_row("自定义", m.host_path, m.container_path, m.readonly)
         self.extra_args_edit.setPlainText(cfg.extra_args)
 
         pre = tpl.precheck

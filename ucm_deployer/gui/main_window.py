@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -27,13 +28,16 @@ from .widgets.container_page import ContainerPage
 from .widgets.image_page import ImagePage
 from .widgets.precheck_page import PrecheckPage
 from .widgets.server_page import ServerPage
+from .widgets.service_page import ServicePage
 
 _STEPS = [
     ("步骤1：服务器管理", "登录服务器并探测设备型号、卡数与 CPU 架构"),
     ("步骤2：镜像准备", "复用已含 UCM 的镜像，或按需构建新 UCM 镜像"),
     ("步骤3：容器准备", "按需创建 UCM 容器；已有容器可直接进入步骤4"),
     ("步骤4：环境预检", "显式选择容器并运行 UCM 环境预检"),
-    ("步骤5：批量部署", "多台服务器分发镜像、创建容器并预检；支持数据模板导入导出"),
+    ("步骤5：服务部署", "写入 UCM 配置文件并在容器内拉起推理服务；多台服务器请用下方批量部署"),
+    ("（可选）批量部署",
+     "多台服务器时使用：一键分发镜像、创建容器并预检；支持模板导入导出。单台直接走步骤3/4"),
 ]
 
 
@@ -110,14 +114,25 @@ class MainWindow(QMainWindow):
 
         # ---------- 页面
         self.pages = QStackedWidget()
+        # QStackedWidget 的 minimumSizeHint 取所有页面的最大值：任一页面
+        # minimum 过高会绑架整个窗口的最小高度，空间不足时布局溢出、
+        # 裁掉左侧栏底部（上一步/下一步按钮消失）。显式 minimum 归零，
+        # 让超高页面改由内部滚动区消化（见 _wrap_scroll）。
+        self.pages.setMinimumSize(0, 0)
         self.server_page = ServerPage(self.ctx)
         self.image_page = ImagePage(self.ctx)
         self.container_page = ContainerPage(self.ctx)
         self.precheck_page = PrecheckPage(self.ctx)
+        self.service_page = ServicePage(self.ctx)
         self.batch_page = BatchPage(self.ctx)
-        for p in (self.server_page, self.image_page,
-                  self.container_page, self.precheck_page, self.batch_page):
-            self.pages.addWidget(p)
+        self.pages.addWidget(self.server_page)
+        # minimum 高度超过 860 一屏预算的页面套滚动区：小窗口下可滚动，
+        # 不再抬升窗口最小高度（窗口可自由调整大小）
+        self.pages.addWidget(self._wrap_scroll(self.image_page))
+        self.pages.addWidget(self._wrap_scroll(self.container_page))
+        self.pages.addWidget(self._wrap_scroll(self.precheck_page))
+        self.pages.addWidget(self._wrap_scroll(self.service_page))
+        self.pages.addWidget(self._wrap_scroll(self.batch_page))
 
         center = QHBoxLayout()
         center.setContentsMargins(12, 12, 12, 12)
@@ -138,6 +153,15 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     # ------------------------------------------------------------ 菜单
+    @staticmethod
+    def _wrap_scroll(page: QWidget) -> QScrollArea:
+        """把超高页面包进滚动区：窗口过矮时页面内容可滚动而非撑爆窗口。"""
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.NoFrame)
+        sa.setWidget(page)
+        return sa
+
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
         act_quit = QAction("退出", self)
@@ -247,6 +271,8 @@ class MainWindow(QMainWindow):
         elif row == 3:
             self.precheck_page.on_enter()
         elif row == 4:
+            self.service_page.on_enter()
+        elif row == 5:
             self.batch_page.on_enter()
 
         self._active_row = row

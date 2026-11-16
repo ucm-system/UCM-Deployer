@@ -66,7 +66,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ inputs.tag || github.ref_name }}"
-          gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes || $true
+          $null = gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes 2>&1
+          if ($LASTEXITCODE -eq 0) { Write-Host "existing release deleted" } else { Write-Host "no existing release (first publish), skip" }
+          exit 0
 
       - name: 上传到 GitHub Release
         uses: softprops/action-gh-release@v2

@@ -82,19 +82,19 @@ class PrecheckPage(QWidget):
             "「浏览」列出容器内可见的目录；带宽检查将在该目录下创建临时子目录\n"
             "ucm-precheck-* 执行读写负载，预检结束后自动清理；请确保目录有可用空间。")
         mount_btn = QPushButton("浏览...")
+        self.mount_btn = mount_btn
         mount_btn.clicked.connect(self._browse_mount)
-        self.mount_hint = QLabel(
-            "带宽检查：在挂载目录下创建临时子目录（运行日志播报路径），结束后自动清理；"
-            "关闭带宽检查则仅检查环境（驱动/内核/共享内存/AIO）。")
-        self.mount_hint.setProperty("role", "hint")
-        self.mount_hint.setWordWrap(True)
 
         run_btn = QPushButton("🔍 开始预检")
         run_btn.setProperty("accent", True)
+        run_btn.setToolTip(
+            "在目标容器内执行 ucm-toolkit run precheck；\n"
+            "过程与结果日志见底部任务记录。")
         run_btn.clicked.connect(self._run)
 
         # 预检参数配置入口（容器内 JSON，--config 叠加于出厂默认之上）
-        self.config_btn = QPushButton("⚙ 预检参数配置...")
+        self.config_btn = QPushButton("⚙ 预检参数设置")
+        self.config_btn.setFlat(True)   # 低频高级操作：弱化为文字按钮
         self.config_btn.setToolTip(
             "查看/编辑容器内的 precheck JSON 配置（带宽矩阵、阈值等），\n"
             "保存到容器内 " + CONFIG_CONTAINER_PATH +
@@ -110,19 +110,22 @@ class PrecheckPage(QWidget):
         container_row.addWidget(self.container_combo, 1)
         container_row.addWidget(refresh_container_btn)
         cfg_layout.addLayout(container_row)
-        cfg_layout.addWidget(self.container_label)
-        cfg_layout.addWidget(self.bandwidth_check)
+        cfg_layout.addWidget(self.container_label)   # 未登录/未选择时才显示
+        # 操作行：选项（带宽）+ 低频配置在左，主操作（开始预检）独占行尾
+        run_row = QHBoxLayout()
+        run_row.addWidget(self.bandwidth_check)
+        run_row.addSpacing(12)
+        run_row.addWidget(self.config_btn)
+        run_row.addWidget(self.config_status_label)
+        run_row.addStretch(1)
+        run_row.addWidget(run_btn)
+        cfg_layout.addLayout(run_row)
+        # 挂载目录与「目标容器」标签左对齐
         mount_row = QHBoxLayout()
         mount_row.addWidget(QLabel("挂载目录"), 0)
         mount_row.addWidget(self.mount_edit, 1)
         mount_row.addWidget(mount_btn)
-        mount_row.addWidget(run_btn)
         cfg_layout.addLayout(mount_row)
-        config_row = QHBoxLayout()
-        config_row.addWidget(self.config_btn)
-        config_row.addWidget(self.config_status_label, 1)
-        cfg_layout.addLayout(config_row)
-        cfg_layout.addWidget(self.mount_hint)
 
         # ---------- 结果
         result_box = QGroupBox("2. 预检结果")
@@ -151,19 +154,19 @@ class PrecheckPage(QWidget):
 
         result_layout = QVBoxLayout(result_box)
         result_layout.setSpacing(4)
+        result_layout.addWidget(self.summary_label)   # 结论置顶：先总结后明细
         layout_row = QHBoxLayout()
         layout_row.addWidget(self.result_table, 3)
         layout_col = QVBoxLayout()
         layout_col.addWidget(self.detail_view, 1)
         layout_row.addLayout(layout_col, 2)
         result_layout.addLayout(layout_row)
-        result_layout.addWidget(self.summary_label)
 
         self.panel = ParallelTaskPanel()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(12)              # 与步骤3 一致：模块间顺序感
         layout.addWidget(cfg_box)
         layout.addWidget(result_box, 1)
         layout.addWidget(self.panel, 2)
@@ -235,11 +238,10 @@ class PrecheckPage(QWidget):
         self._run_quick(fn, on_done)
 
     def _on_bandwidth_toggled(self, *_) -> None:
-        """带宽检查开关：关闭时挂载目录不可用（免填）。"""
+        """带宽检查开关：关闭时挂载目录与浏览按钮禁用（已填路径保留）。"""
         on = self.bandwidth_check.isChecked()
         self.mount_edit.setEnabled(on)
-        if not on:
-            self.mount_edit.clear()
+        self.mount_btn.setEnabled(on)
 
     def _refresh_config_status(self) -> None:
         """后台探测容器内自定义配置是否存在（应对容器重建/手动删除）。"""
@@ -281,16 +283,18 @@ class PrecheckPage(QWidget):
         self._refresh_config_status()
 
     def _refresh_container_label(self) -> None:
+        """未登录/未选择时显示提示；已选容器时隐藏（下拉框已展示名字，不重复）。"""
         server = self.ctx.server
         name = self._selected_container()
         if name:
+            self.container_label.setVisible(False)
+            return
+        self.container_label.setVisible(True)
+        if server:
             self.container_label.setText(
-                f"目标容器：{name}（预检将显式在该容器内执行）")
-        elif server:
-            self.container_label.setText(
-                "目标容器：未选择（可刷新后选择已有容器，或回步骤3创建）")
+                "未选择容器（可刷新后选择已有容器，或回步骤3创建）")
         else:
-            self.container_label.setText("未登录服务器（请先在步骤1勾选）")
+            self.container_label.setText("未登录服务器（请先在步骤1点选）")
 
     def _browse_mount(self) -> None:
         server = self.ctx.server
@@ -430,7 +434,7 @@ class PrecheckPage(QWidget):
             QMessageBox.warning(
                 self, "预检完成（有警告）",
                 f"预检已运行完毕，存在 {result.warn_count} 项 WARN"
-                "（未达 FAIL，可继续部署但建议排查）。\n{result.summary}")
+                f"（未达 FAIL，可继续部署但建议排查）。\n{result.summary}")
         else:
             self.summary_label.setText(f"✗ 预检未通过{tail}")
             QMessageBox.warning(

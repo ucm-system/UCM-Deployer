@@ -1,84 +1,74 @@
-# 步骤5 · 批量部署（多服务器）
+# 步骤5 · 服务部署
 
-在**一台服务器上制作好镜像**（步骤1-2）后，向**多台目标服务器**批量执行：
+**纯操作指引页**：页面按操作顺序给出三个模块——UCM 配置文件参考配置、推理服务拉起命令模板与注意事项、连通性验证命令。所有内容可直接复制，在容器内手动完成后按模块3 验证服务是否就绪。
 
-```
-镜像分发 → 容器创建 → 环境预检
-```
+## ① UCM 配置文件
 
-每台服务器在执行面板中拥有**独立进度条与独立日志页签**；多台服务器的登录信息、容器创建参数与预检参数支持**数据模板（JSON）导出/导入**，一次填写、多机复用。
+页面给出 UCM 配置文件参考默认配置（`UcmPipelineStore` 连接器，`Cache|Posix` 存储管线），`storage_backends`、`posix_capacity_gb`、`posix_io_engine`、`posix_data_trans_concurrency` 等参数请**按实际存储环境修改**：
 
-## 操作流程
-
-### 1. 选择镜像来源
-
-| 分发方式 | 说明 | 适用 |
-|---|---|---|
-| **镜像包中转**（默认） | 源服务器 `docker save \| gzip -1` 导出 → 下载到本机 → 各目标并行上传并 `docker load` | 离线集群（目标无法访问镜像仓库） |
-| **镜像仓库** | 各目标服务器直接 `docker pull` | 目标可访问仓库（内网 registry / 公有仓库） |
-
-- 进入本页时自动带入步骤2 构建完成的镜像与源服务器；
-- 「目标已存在同名镜像时跳过分发」：逐台 `docker image inspect` 检查，已存在则跳过上传/拉取（重复执行/增量补装场景）；
-- tar 模式下源服务器作为面板**首行**先准备镜像包，其余目标等待就绪后**并行**分发。
-
-### 2. 勾选目标服务器
-
-从注册表勾选**多台**目标（支持「全选 / 清空 / 刷新」）。源服务器也可以同时作为目标——其镜像分发阶段自动跳过（镜像已在本机），容器创建与预检照常执行。
-
-### 3. 填写部署配置模板
-
-对全部目标生效，设备差异自动适配：
-
-| 页签 | 配置 |
-|---|---|
-| **容器配置** | 容器名 / shm-size / --net / 端口映射（NVIDIA）/ KV Cache 目录 / 模型挂载（只读可选）/ 额外挂载 / 附加 docker 参数 |
-| **预检配置** | 是否执行带宽检查 / 容器内挂载目录 / 自定义预检 JSON（写入每个目标容器并以 `--config` 引用） |
-
-- **Ascend 目标**逐台现场探测实际存在的设备节点（`/dev/davinci*`、`/dev/ummu` 等，存在时自动 `--privileged`）与驱动/工具挂载；
-- **NVIDIA 目标**自动使用 `--runtime nvidia --gpus all`；
-- 创建容器前自动校验镜像内 UCM 安装（未安装则该服务器失败并说明原因）。
-
-### 4. 开始批量部署
-
-勾选要执行的阶段（可任意组合：仅分发 / 分发+创建 / 全流程），可选「同名容器先删除再创建」（重复执行场景）。点「🚀 开始批量部署」：
-
-- 每台服务器一行进度条：按阶段权重映射（分发 45% / 创建 25% / 预检 30%）；
-- 每台服务器一页日志：完整命令与输出，单台失败**不影响其他服务器**继续执行；
-- 结束后弹出汇总（每台：镜像分发/跳过、容器名、预检判定）。
-
-## 数据模板：导出 / 导入
-
-多台服务器的**登录信息、容器创建参数、预检参数**往往重复填写——保存为部署数据模板后可分享复用：
-
-- **📤 导出部署模板**：当前勾选的目标服务器登录信息 + 镜像来源 + 容器/预检配置 → JSON 文件。登录密码/私钥口令默认**不**导出（确认后可包含，注意明文存储风险）；
-- **📥 导入部署模板**：一次填充全部配置；模板中的服务器按 `主机+端口+用户名` 匹配写入本机注册表（已存在则更新，模板密码为空时保留本地密码），并自动勾选为目标；
-- 模板是纯 JSON，可手工编辑 / 批量生成后分发，同事在其机器上导入即用。
-
-```json
-{
-  "kind": "ucm-deployer-batch-template",
-  "template_version": 1,
-  "image": {
-    "mode": "tar", "ref": "ucm-vllm:0.3.6",
-    "source_host": "10.0.0.10", "source_port": 22,
-    "skip_existing": true, "recreate_container": false
-  },
-  "container": {
-    "name": "ucm-vllm", "shm_size": "512g", "network": "host",
-    "ports": ["8000:8000"], "kv_cache_dirs": ["/mnt/kvcache"],
-    "model_mount": {"host_path": "/data/models", "container_path": "/models", "readonly": true},
-    "extra_mounts": [], "extra_args": ""
-  },
-  "precheck": {
-    "bandwidth_check": true, "mount_path": "/mnt/kvcache",
-    "custom_config_enabled": false, "custom_config_json": {}
-  },
-  "servers": [
-    {"name": "node-1", "host": "10.0.0.11", "port": 22, "username": "root",
-     "auth_type": "password", "password": "", "remark": ""}
-  ]
-}
+```yaml
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      storage_backends: "/mnt/test"
+      posix_capacity_gb: 10240
+      posix_io_engine: "psync"
+      posix_data_trans_concurrency: 128
 ```
 
-!!! tip "常见失败排查"
-    批量执行单台失败不影响其他服务器。汇总后展开该服务器的日志页签排查，常见原因：SSH 不通、磁盘空间不足、镜像无 UCM、挂载目录在容器内不存在。
+- 将配置保存为 yaml 文件（如 `/workspace/ucm_config_example.yaml`，路径可自定义）；
+- **路径需与拉起命令中 `UCM_CONFIG_FILE` 保持一致**；
+- 详细参数说明见页面配置框下方的 [UCM 参数配置说明（华为官方文档）](https://support.huawei.com/enterprise/zh/doc/EDOC1100582752/b4b5937b?idPath=7919749%7C251366268%7C250389224%7C263153904%7C268354339)（链接可点击跳转）。
+
+## ② 推理服务拉起命令（在容器内执行）
+
+注意事项：
+
+1. 拉起服务前需先导出环境变量：`export ENABLE_UCM_PATCH=1`、`export VLLM_CPU_AFFINITY=1`；
+2. 拉起命令后必须附加 `--kv-transfer-config`，通过 UCMConnector 把 UCM 接入 vLLM；
+3. 其中 `UCM_CONFIG_FILE` 为 UCM 配置文件路径，指向①中保存的 yaml（可自定义修改，两处路径必须一致）。
+
+命令模板（模型路径 / 端口等按实际填写）：
+
+```bash
+export ENABLE_UCM_PATCH=1
+export VLLM_CPU_AFFINITY=1
+
+vllm serve /models/Qwen ... \
+    --kv-transfer-config '{
+        "kv_connector": "UCMConnector",
+        "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "UCM_CONFIG_FILE": "/workspace/ucm_config_example.yaml"
+        }
+    }'
+```
+
+## ③ 验证连通性（服务就绪后，在宿主机另开终端）
+
+端口 `7800` 与模型名 `qwen3.8` 按实际替换：
+
+```bash
+curl --fail http://127.0.0.1:7800/health
+curl --fail http://127.0.0.1:7800/v1/models
+
+curl --fail-with-body http://127.0.0.1:7800/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model": "qwen3.8",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Explain the role of KV cache in large language model inference."
+            }
+        ],
+        "max_completion_tokens": 512,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": false}
+    }'
+```
+
+!!! tip "可复制 + 可拖高"
+    三个模块的配置 / 命令展示框均可直接选中复制，右下角拖动手柄可调整高度，方便完整查看长命令。

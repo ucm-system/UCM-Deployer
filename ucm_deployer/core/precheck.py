@@ -63,6 +63,11 @@ _CHECK_ZH = {
         "存储带宽",
         "检查挂载点所在磁盘/NVMe 的实际吞吐；尝试 aio 引擎或提高 --workers；"
         "确认 io_direct/O_DIRECT 设置；网络存储（NFS 等）需同时检查网络带宽。"),
+    "smmu_host": (
+        "SMMU 开关（宿主机）",
+        "SMMU/IOMMU 由服务器 BIOS 控制，部署预期为关闭：宿主机 dmesg 中不应出现 "
+        "arm-smmu-v3。若已开启，请进入 BIOS 关闭 SMMU 后重试，"
+        "否则 NPU 直通 IO 性能可能明显下降。"),
 }
 
 
@@ -244,6 +249,38 @@ class PrecheckRunner:
                 "挂载存储上执行）。")
 
     # ------------------------------------------------------------ 配置文件
+    def check_smmu_host(self) -> PrecheckItem:
+        """宿主机检查 SMMU/IOMMU 是否开启（预期关闭；不在容器内执行）。
+
+        dmesg 可读且无 arm-smmu-v3 输出 -> PASS（未开启，符合预期）；
+        有输出 -> WARN（已开启，建议进 BIOS 关闭）；
+        dmesg 权限受限 -> SKIP（提示手动检查，避免把权限问题误判为未开启）。
+        """
+        name_zh, advice = _CHECK_ZH["smmu_host"]
+        item = PrecheckItem(status="SKIP", name="smmu_host",
+                            name_zh=name_zh, advice=advice)
+        source = "[deployer] fact source: dmesg（宿主机，非容器）"
+        perm = self.ssh.exec("dmesg >/dev/null 2>&1", timeout=30)
+        if not perm.ok:
+            item.summary = "无法读取 dmesg（权限受限），请手动确认"
+            item.detail = (source + "\n"
+                           "手动检查: dmesg | grep -i arm-smmu-v3"
+                           "（无输出 = 未开启）")
+            return item
+        res = self.ssh.exec(
+            "dmesg | grep -i 'arm-smmu-v3' | head -20", timeout=60)
+        lines = [l.strip() for l in (res.stdout or "").splitlines()
+                 if l.strip()]
+        if lines:
+            item.status = "WARN"
+            item.summary = "SMMU 已开启（预期应为关闭）"
+            item.detail = source + "\n" + "\n".join(lines[:5])
+        else:
+            item.status = "PASS"
+            item.summary = "SMMU 未开启（符合预期）"
+            item.detail = source
+        return item
+
     def locate_default_config(self, container: str) -> str:
         """定位容器内随 ucm-toolkit 安装的 precheck.defaults.json 路径。
 
@@ -380,6 +417,13 @@ class PrecheckRunner:
         result = parse_precheck_output(res)
         if _precheck_needs_facts(result):
             enhance_precheck_result(result, self.collect_precheck_facts(container))
+        # 宿主机侧附加检查：SMMU/IOMMU 预期关闭（BIOS 开关；不在容器内执行）。
+        # 任何异常都不影响主预检结果（仅少一项展示）。
+        try:
+            result.items.append(self.check_smmu_host())
+            _refresh_precheck_summary(result)
+        except Exception:
+            logger.warning("宿主机 SMMU 检查失败", exc_info=True)
         return result
 
 

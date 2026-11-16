@@ -8,12 +8,13 @@ Python 线程由解释器统一管理更稳妥；信号经 QObject 容器跨线�
 """
 from __future__ import annotations
 
+import os
 import threading
 import weakref
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, ClassVar, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QDateTime, QEvent, QObject, QStandardPaths, Qt, Signal
+from PySide6.QtGui import QFont, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -211,6 +213,9 @@ class ParallelTaskPanel(QWidget):
 
     finished_all = Signal(bool)
 
+    # shutdown 超时未结束的线程脱离托管（不能 terminate：曾引发进程级 abort）
+    _ORPHANS: "ClassVar[set]" = set()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._threads: List[ServerTaskThread] = []
@@ -230,20 +235,62 @@ class ParallelTaskPanel(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
+        # 常驻占位日志页：无任务时填满面板下方空白，任务启动后由任务页签替换。
+        # Ignored 尺寸策略：不抬高 tabs 的最小高度（否则会顶爆一屏排版）。
+        self._placeholder_log = QLabel(
+            "暂无任务日志。执行操作（扫描镜像 / 构建 / 创建容器 / 预检等）后，\n"
+            "任务的过程与结果日志会显示在此处，可随时点击「⬇ 导出日志」保存。")
+        self._placeholder_log.setAlignment(Qt.AlignCenter)
+        self._placeholder_log.setWordWrap(True)
+        self._placeholder_log.setProperty("role", "hint")
+        self._placeholder_log.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.tabs.addTab(self._placeholder_log, "日志")
+        self.tabs.setMinimumHeight(76)   # 保证任务面板有可用高度（不被压缩过扁）
+        # 无任务初始态隐藏页签头：占位提示直接展示（「日志」二字只在数据层保留）
+        self.tabs.tabBar().setVisible(False)
 
         self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
-        self.title_label = QLabel("")
+        self.export_btn = QPushButton("⬇ 导出日志")
+        self.export_btn.setToolTip(
+            "将当前页签的任务日志导出为 .log 文件（含原始输出，便于定位问题）")
+        self.export_btn.clicked.connect(self._export_log)
+        self.title_label = QLabel("任务记录")
         self.title_label.setStyleSheet("color:#64748b;")
+        # 紧凑模式（单任务）：单行进度条 + 状态文字，隐藏表格与页签栏
+        self.compact_bar = QProgressBar()
+        self.compact_bar.setRange(0, 100)
+        self.compact_bar.setValue(0)
+        self.compact_bar.setFormat("等待中")
+        self.compact_status = QLabel("")
+        self.compact_status.setStyleSheet("color:#64748b;")
         top = QHBoxLayout()
         top.addWidget(self.title_label)
+        top.addWidget(self.compact_bar, 1)
+        top.addWidget(self.compact_status)
         top.addStretch(1)
+        top.addWidget(self.export_btn)
         top.addWidget(self.cancel_btn)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(top)
         layout.addWidget(self.table)
         layout.addWidget(self.tabs, 1)
+
+        # 无任务初始态：隐藏空表格（0 行）与"等待中"进度条，避免大片无意义空白；
+        # start() 时按任务数由 _apply_mode 设置显示模式
+        self.table.setVisible(False)
+        self.compact_bar.setVisible(False)
+        self.compact_status.setVisible(False)
+
+    def _apply_mode(self, compact: bool) -> None:
+        """单任务紧凑 / 多任务完整两种呈现；数据结构不变。"""
+        self.table.setVisible(not compact)
+        self.tabs.tabBar().setVisible(not compact)
+        self.compact_bar.setVisible(compact)
+        self.compact_status.setVisible(compact)
 
     # ------------------------------------------------------------ API
     def is_running(self) -> bool:
@@ -255,12 +302,17 @@ class ParallelTaskPanel(QWidget):
         if self.is_running():
             QMessageBox.warning(self, "忙碌", "有任务正在执行，请等待完成或取消")
             return False
+        self._apply_mode(len(tasks) == 1)
         self._threads = []
         self._results = {}
         self._total = len(tasks)
         self._logs = {}
         self._bars = {}
         self.title_label.setText(title if title else "")
+        self.compact_bar.setValue(0)
+        self.compact_bar.setFormat("等待中")
+        self.compact_status.setStyleSheet("color:#64748b;")
+        self.compact_status.setText("排队中" if tasks else "")
         self.table.setRowCount(0)
         while self.tabs.count():
             self.tabs.removeTab(0)
@@ -332,6 +384,9 @@ class ParallelTaskPanel(QWidget):
             t.request_cancel()
         for t in self._threads:
             t.join(timeout=timeout_s)
+            if t.is_alive():
+                # 不 terminate（曾引发进程级 abort）：脱离托管，任其自然结束
+                self._ORPHANS.add(t)
 
     # ------------------------------------------------------------ 内部
     def _cancel(self) -> None:
@@ -339,6 +394,30 @@ class ParallelTaskPanel(QWidget):
             t.request_cancel()
         self.cancel_btn.setEnabled(False)
         self._set_status_all("正在取消...")
+
+    def _export_log(self) -> None:
+        """导出当前页签的任务日志到本地文件（UTF-8，便于存档/定位问题）。"""
+        from PySide6.QtWidgets import QFileDialog
+
+        edit = self.tabs.currentWidget()
+        text = edit.toPlainText() if isinstance(edit, QPlainTextEdit) else ""
+        if not text.strip():
+            QMessageBox.information(self, "提示", "当前任务暂无日志内容")
+            return
+        title = (self.title_label.text() or "任务").strip()
+        safe = "".join(c for c in title if c not in '\\/:*?"<>|').strip() or "任务"
+        stamp = QDateTime.currentDateTime().toString("yyyyMMdd-HHmmss")
+        default_dir = QStandardPaths.writableLocation(
+            QStandardPaths.DownloadLocation) or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出日志",
+            os.path.join(default_dir, f"ucm-deployer-{safe}-{stamp}.log"),
+            "日志文件 (*.log *.txt);;所有文件 (*)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        QMessageBox.information(self, "完成", f"日志已导出:\n{path}")
 
     def _row_of(self, thread: ServerTaskThread) -> int:
         for i, t in enumerate(self._threads):
@@ -350,7 +429,19 @@ class ParallelTaskPanel(QWidget):
         bar = self._bars.get(thread)
         if bar is not None:
             bar.setValue(max(0, min(100, int(pct))))
-            bar.setFormat(f"{pct}%  {msg}" if msg else f"{pct}%")
+            # 进度条只显示百分比；具体信息进入状态列，避免两处重复
+            bar.setFormat(f"{pct}%")
+            if msg:
+                row = self._row_of(thread)
+                item = self.table.item(row, 2) if row >= 0 else None
+                if item is not None:
+                    item.setText(msg)
+                    item.setForeground(Qt.darkGray)
+        if self.compact_bar.isVisible():
+            self.compact_bar.setValue(max(0, min(100, int(pct))))
+            self.compact_bar.setFormat(f"{pct}%")
+            if msg:
+                self.compact_status.setText(msg)
 
     def _on_log(self, thread: ServerTaskThread, line: str) -> None:
         edit = self._logs.get(thread)
@@ -369,9 +460,8 @@ class ParallelTaskPanel(QWidget):
         bar = self._bars.get(thread)
         if bar is not None:
             if ok:
-                if bar.value() < 100:
-                    bar.setValue(100)
-                    bar.setFormat("100%  完成")
+                bar.setValue(100)
+                bar.setFormat("100%")
             else:
                 bar.setFormat("失败")
         if row >= 0:
@@ -381,6 +471,15 @@ class ParallelTaskPanel(QWidget):
                 self.table.setItem(row, 2, item)
             item.setText(("✓ " if ok else "✗ ") + message)
             item.setForeground(Qt.darkGreen if ok else Qt.red)
+        if self.compact_bar.isVisible():
+            if ok:
+                self.compact_bar.setValue(100)
+                self.compact_bar.setFormat("100%")
+            else:
+                self.compact_bar.setFormat("失败")
+            self.compact_status.setText(("✓ " if ok else "✗ ") + message)
+            self.compact_status.setStyleSheet(
+                "color:#16a34a;" if ok else "color:#dc2626;")
         if self._total and len(self._results) >= self._total:
             self.cancel_btn.setEnabled(False)
             all_ok = all(ok for ok, _ in self._results.values())
@@ -458,3 +557,76 @@ class RemoteDirDialog(QDialog):
 
     def selected_path(self) -> Optional[str]:
         return self._selected
+
+
+# ============================================================ 输入框拖动手柄
+class _EditGrip(QWidget):
+    """多行输入框右下角的拖动手柄：按住上下拖动调整输入框高度。
+
+    浮在输入框内部右下角（不占布局空间），随输入框尺寸变化自动归位。
+    自绘三条斜纹提示可拖拽；注意不能用 QSizeGrip——它会去缩放整个窗口。
+    """
+
+    MIN_H = 40
+    MAX_H = 480
+
+    def __init__(self, edit: QWidget, on_delta=None) -> None:
+        super().__init__(edit)
+        self._edit = edit
+        self._on_delta = on_delta   # 高度变化回调（联动其他部件用）
+        self._press_y = 0.0
+        self._press_h = 0
+        self.setFixedSize(12, 12)
+        self.setCursor(Qt.SizeVerCursor)
+        edit.installEventFilter(self)
+        self._reposition()
+
+    def eventFilter(self, obj, ev):  # noqa: N802 (Qt 命名)
+        # PySide6 可能在 Python __init__ 完成前回调虚函数（属性未就绪）
+        edit = getattr(self, "_edit", None)
+        if edit is not None and obj is edit and ev.type() == QEvent.Resize:
+            self._reposition()
+        return False
+
+    def showEvent(self, ev):  # noqa: N802 (Qt 命名)
+        self._reposition()
+
+    def _reposition(self) -> None:
+        e = self._edit
+        self.move(e.width() - self.width() - 1, e.height() - self.height() - 1)
+
+    def mousePressEvent(self, ev) -> None:  # noqa: N802 (Qt 命名)
+        if ev.button() == Qt.LeftButton:
+            self._press_y = ev.globalPosition().y()
+            self._press_h = self._edit.height()
+            ev.accept()
+
+    def mouseMoveEvent(self, ev) -> None:  # noqa: N802 (Qt 命名)
+        if self._press_h:
+            delta = ev.globalPosition().y() - self._press_y
+            h = max(self.MIN_H, min(self._press_h + int(delta), self.MAX_H))
+            old = self._edit.height()
+            self._edit.setFixedHeight(h)
+            if self._on_delta is not None and h != old:
+                self._on_delta(h - old)
+            ev.accept()
+
+    def mouseReleaseEvent(self, ev) -> None:  # noqa: N802 (Qt 命名)
+        self._press_h = 0
+        ev.accept()
+
+    def paintEvent(self, ev) -> None:  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        p.setPen(self.palette().color(QPalette.Mid))
+        w, h = self.width(), self.height()
+        for i in range(1, 4):
+            p.drawLine(w - i * 4, h - 1, w - 1, h - i * 4)
+
+
+def attach_resize_grip(edit: QWidget, on_delta=None) -> _EditGrip:
+    """给多行输入框右下角加拖动手柄，返回 grip 实例（随 edit 存活）。
+
+    on_delta(delta)：输入框高度每变化 delta 时回调；可用于让页面上
+    另一个可伸缩区域反向等量变化，保持页面总高稳定（布局不跳动）。
+    """
+    return _EditGrip(edit, on_delta)

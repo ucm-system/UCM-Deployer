@@ -191,12 +191,13 @@ def test_nav_is_flat_buttons(qapp):
 
     win = MainWindow()
     qapp.processEvents()
-    assert len(win._nav_buttons) == 5
+    assert len(win._nav_buttons) == 6
     assert win.nav_group.exclusive()
     for i, btn in enumerate(win._nav_buttons):
         # 不是 QListWidget 之类的滚动视图
         assert btn.objectName() == "navBtn"
-        assert btn.text().startswith(f"步骤{i + 1}：")
+        expected = f"步骤{i + 1}：" if i < 5 else "（可选）批量部署"
+        assert btn.text().startswith(expected)
         assert btn.isCheckable()
     assert win._nav_buttons[0].isChecked()
     # 程序化切换不触发守卫重入：goto_step 生效
@@ -302,7 +303,7 @@ def test_nav_rejected_restores_previous_step(qapp, tmp_path):
     assert win.current_step() == 1, "无镜像时步骤3应被拒并停留在步骤2"
     assert win._nav_buttons[1].isChecked(), "被拒后按钮选中态应回到步骤2"
 
-    # 有镜像 -> 步骤3可进；无容器 -> 步骤4被拒；无脚本 -> 步骤5被拒
+    # 有镜像 -> 步骤3可进；无容器 -> 步骤4被拒；无脚本 -> 批量部署被拒
     win.ctx.images = {s.id: "img:t"}
     win.goto_step(2)
     qapp.processEvents()
@@ -314,9 +315,9 @@ def test_nav_rejected_restores_previous_step(qapp, tmp_path):
     win.goto_step(3)
     qapp.processEvents()
     assert win.current_step() == 3
-    win.goto_step(4)
+    win.goto_step(5)
     qapp.processEvents()
-    assert win.current_step() == 3, "无脚本时步骤5应被拒并停留在步骤4"
+    assert win.current_step() == 3, "无脚本时批量部署应被拒并停留在步骤4"
     win.close()
 
 

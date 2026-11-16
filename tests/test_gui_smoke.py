@@ -85,11 +85,13 @@ def test_nav_is_flat_buttons(qapp):
 
     win = MainWindow()
     qapp.processEvents()
-    assert len(win._nav_buttons) == 5
+    assert len(win._nav_buttons) == 6
     assert win.nav_group.exclusive()
     for i, btn in enumerate(win._nav_buttons):
         assert btn.objectName() == "navBtn"
-        assert btn.text().startswith(f"步骤{i + 1}：")
+        # 步骤5 之后是「（可选）批量部署」，无编号前缀
+        expected = f"步骤{i + 1}：" if i < 5 else "（可选）批量部署"
+        assert btn.text().startswith(expected)
         assert btn.isCheckable()
     assert win._nav_buttons[0].isChecked()
     win.goto_step(0)
@@ -165,7 +167,7 @@ def test_container_page_fits_one_screen(qapp):
         f"步骤3 最小高度 {page.minimumSizeHint().height()}px 超过可用 {available}px"
     # 布局实际分配后：命令编辑框/挂载表格/任务面板均获得可用尺寸（未被压没）
     assert page.cmd_edit.height() >= 100, f"命令框被压缩: {page.cmd_edit.height()}px"
-    assert page.extra_table.height() >= 60, f"自定义挂载表格被压缩: {page.extra_table.height()}px"
+    assert page.mount_table.height() >= 60, f"统一挂载表被压缩: {page.mount_table.height()}px"
     assert page.panel.height() >= 100, f"任务面板被压缩: {page.panel.height()}px"
     win.close()
 
@@ -224,8 +226,6 @@ def test_main_window_no_black_areas(qapp):
 
 # ============================================================ 步骤1：服务器单选
 def test_server_page_single_selection(qapp, tmp_path):
-    from PySide6.QtCore import Qt
-
     from ucm_deployer.core.server_registry import ServerRegistry
     from ucm_deployer.gui.state import AppContext
     from ucm_deployer.gui.widgets.server_page import ServerPage
@@ -237,23 +237,22 @@ def test_server_page_single_selection(qapp, tmp_path):
     # 回归：构造后（打开程序）即显示历史服务器，无需先添加一条
     assert page.table.rowCount() == 2
 
-    page.table.item(0, 0).setCheckState(Qt.Checked)
+    # 点选第一行 = 选定当前操作服务器
+    page.table.selectRow(0)
     qapp.processEvents()
     assert len(ctx.selected) == 1
     assert ctx.selected[0].name == "node1"
 
-    # 再勾选第二台 -> 单选：第一台自动取消
-    page.table.item(1, 0).setCheckState(Qt.Checked)
+    # 再点选第二行 -> 单选自动切换
+    page.table.selectRow(1)
     qapp.processEvents()
     assert len(ctx.selected) == 1
     assert ctx.selected[0].name == "node2"
     assert ctx.server.name == "node2"
 
 
-def test_server_page_actions_target_checked(qapp, tmp_path):
-    """回归：编辑/删除作用于勾选的服务器（不再用 currentRow，避免焦点转移后残留）。"""
-    from PySide6.QtCore import Qt
-
+def test_server_page_actions_target_selected(qapp, tmp_path):
+    """回归：编辑/删除作用于点选的服务器行（经 userData 寻址，与行序解耦）。"""
     from ucm_deployer.core.server_registry import ServerRegistry
     from ucm_deployer.gui.state import AppContext
     from ucm_deployer.gui.widgets.server_page import ServerPage
@@ -263,21 +262,19 @@ def test_server_page_actions_target_checked(qapp, tmp_path):
     _mk_server(ctx, "node2", "10.0.0.2")
     page = ServerPage(ctx)
 
-    # 未勾选时：操作对象为 None（各操作弹提示，不误用旧行）
+    # 未点选时：操作对象为 None（各操作弹提示，不误用旧行）
     assert page._current_server() is None
 
-    # 勾选 node1 后：即使焦点/选中行在其他位置，操作对象仍是勾选的 node1
-    page.table.item(0, 0).setCheckState(Qt.Checked)
-    qapp.processEvents()
-    page.table.setCurrentCell(1, 2)      # 选中行在 node2（焦点漂移）
+    # 点选 node1 后：操作对象是 node1
+    page.table.selectRow(0)
     qapp.processEvents()
     assert page._current_server().id == s1.id
 
-    # 删除作用于勾选的 node1（而非选中行的 node2）
+    # 删除作用于点选的 node1
     page._delete()
     qapp.processEvents()
     names = [s.name for s in ctx.registry.list_servers()]
-    assert names == ["node2"], "删除应作用于勾选的服务器而非选中行"
+    assert names == ["node2"], "删除应作用于点选的服务器"
     assert ctx.selected == []
 
 
@@ -420,6 +417,44 @@ def test_image_page_download_hints(qapp, tmp_path):
     assert "无需填写安装包或构建" in page.hint.text()
 
 
+def test_image_page_auto_ucm_flow(qapp, tmp_path, fake_ssh):
+    """进入页面自动扫描镜像并检查 UCM：发现已装镜像→提示可跳过并登记；
+    构建区始终常驻（是否构建由用户决定）。"""
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.image_page import ImagePage
+
+    fake_ssh.add_default(r"^docker info", stdout="ok\n")
+    fake_ssh.add_default(
+        r"images --format",
+        stdout=("quay.io/ascend/vllm-ascend\tv0.30.0rc2\tid1\t10GB\t2026-08-01\n"
+                "ucm-engine\tv0.9\tid2\t5GB\t2026-09-01\n"
+                "ucm-engine\tv0.8\tid3\t5GB\t2026-08-01\n"))
+    # 疑似 UCM 镜像的 pip freeze 检查：返回已安装 uc-manager 0.9.0
+    fake_ssh.add_default(r"grep -iE", stdout="uc-manager==0.9.0\n")
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    server = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [server]
+    page = ImagePage(ctx)
+    page.on_enter()
+    assert _wait_panel(page.panel, qapp), "镜像扫描任务超时"
+    qapp.processEvents()
+
+    # 状态行给出「可跳过」引导（不显示版本号），并登记本服务器使用的 UCM 镜像
+    assert "ucm-engine:v0.9" in page.scan_state_label.text()
+    assert "0.9.0" not in page.scan_state_label.text()
+    assert "跳过" in page.scan_state_label.text()
+    assert ctx.images[server.id] == "ucm-engine:v0.9"
+    # short-circuit：找到第一个已装 UCM 镜像后不再检查剩余疑似镜像
+    runs = [c.executed_command for c in fake_ssh.instances[0].channels
+            if c.executed_command.startswith("docker run")]
+    assert len(runs) == 1, "发现已装 UCM 镜像后应停止检查剩余疑似镜像"
+    # 构建区常驻：无论扫描结果如何都在页面上
+    assert page.build_box is not None
+
+
 def test_image_page_refresh_populates_combo(qapp, tmp_path, fake_ssh):
     """回归测试：刷新镜像列表后下拉框必须填充（日志有数据而下拉框空的 bug）。"""
     from ucm_deployer.core.models import ServerInfo
@@ -438,7 +473,7 @@ def test_image_page_refresh_populates_combo(qapp, tmp_path, fake_ssh):
     ctx = AppContext(ServerRegistry(tmp_path))
     ctx.selected = [ServerInfo.create(name="n1", host="127.0.0.1")]
     page = ImagePage(ctx)
-    page._refresh_images()
+    page._scan_images()
     assert _wait_panel(page.panel, qapp), "刷新镜像列表超时"
     qapp.processEvents()
 
@@ -448,6 +483,9 @@ def test_image_page_refresh_populates_combo(qapp, tmp_path, fake_ssh):
     assert combo_ref(page.image_combo) == "ucm-engine:v0.1"
     # 默认镜像名已按所选镜像自动建议（<基础镜像名>:ucm）
     assert page.tag_edit.text().strip() == "ucm-engine:ucm"
+    # 无已安装 UCM 的镜像：状态行报「找不到」（镜像下拉仍正常填充）
+    assert "找不到" in page.scan_state_label.text()
+    assert "构建" in page.scan_state_label.text()
 
 
 def test_image_page_apply_images_triggers_runtime_probe(qapp, tmp_path, monkeypatch):
@@ -473,7 +511,8 @@ def test_image_page_apply_images_triggers_runtime_probe(qapp, tmp_path, monkeypa
 def test_image_page_runtime_updates_package_suggestions(qapp, tmp_path, monkeypatch):
     """选中镜像后展示运行时，并按运行时给出精确 wheel 建议/校验。"""
     from ucm_deployer.core.image_builder import ImageRuntimeInfo
-    from ucm_deployer.core.models import DeviceInfo, DeviceType, DockerImage, ServerInfo
+    from ucm_deployer.core.models import (
+        DeviceInfo, DeviceType, DockerImage, ServerInfo, UCMInfo)
     from ucm_deployer.core.server_registry import ServerRegistry
     from ucm_deployer.gui.state import AppContext
     from ucm_deployer.gui.widgets.common import combo_ref, fill_image_combo
@@ -509,7 +548,7 @@ def test_image_page_runtime_updates_package_suggestions(qapp, tmp_path, monkeypa
         glibc_version="2.34", cann_version="9.2", variant="a5", probe_ok=True)
     monkeypatch.setattr(
         page, "_run_quick",
-        lambda fn, on_done: on_done(runtime, None))
+        lambda fn, on_done: on_done((runtime, UCMInfo()), None))
     page._on_base_image_changed(ref)
 
     assert "Python 3.12" in page.runtime_label.text()
@@ -536,6 +575,11 @@ def test_image_page_pulls_registry_image_on_server(qapp, tmp_path, fake_ssh):
     fake_ssh.add_default(r"^docker pull", stdout="Status: Downloaded\n")
     fake_ssh.add_default(r"docker image inspect", stdout="")
     ref = "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler"
+    # 拉取完成后的自动扫描会重新读取镜像列表（含刚拉取的镜像）
+    fake_ssh.add_default(
+        r"images --format",
+        stdout=("quay.io/ascend/vllm-ascend"
+                "\tv0.30.0rc2-a5-openeuler\tid9\t10GB\t2026-01-01\n"))
 
     ctx = AppContext(ServerRegistry(tmp_path))
     server = ServerInfo.create(name="n1", host="127.0.0.1")
@@ -563,7 +607,11 @@ def test_image_page_pulls_registry_image_on_server(qapp, tmp_path, fake_ssh):
     page.pull_command_edit.setPlainText(malicious)
     page._pull_registry_image()
     assert _wait_panel(page.panel, qapp), "服务器拉取镜像任务超时"
-    commands = [c.executed_command for c in fake_ssh.instances[-1].channels]
+    # 拉取完成后的自动扫描会另开连接；定位实际执行 docker pull 的那条连接
+    pull_inst = next(i for i in reversed(fake_ssh.instances)
+                     if any(c.executed_command.startswith("docker pull")
+                            for c in i.channels))
+    commands = [c.executed_command for c in pull_inst.channels]
     pull = next(c for c in commands if c.startswith("docker pull"))
     assert "; touch /tmp/ucm-pwned" not in pull
     assert f"'{ref};' touch /tmp/ucm-pwned" in pull
@@ -737,7 +785,7 @@ def test_container_page_command_gen(qapp, tmp_path):
 
 
 def test_container_page_kv_and_mounts(qapp, tmp_path):
-    """kvcache 多目录 + 模型挂载 + 自定义挂载进入命令。"""
+    """统一挂载表：KV Cache（同路径锁定）+ 模型（预置行）+ 自定义，一套按钮。"""
     from PySide6.QtCore import Qt
 
     from ucm_deployer.core.models import DeviceInfo, DeviceType, DockerImage, ServerInfo
@@ -760,17 +808,41 @@ def test_container_page_kv_and_mounts(qapp, tmp_path):
     fill_image_combo(page.image_combo, [DockerImage("img", "t1", "i", "1GB")],
                      current="img:t1")
 
-    page.kv_add_row.edit.setText("/mnt/kvcache1")
-    page._kv_add()
-    page.kv_add_row.edit.setText("/mnt/kvcache2")
-    page._kv_add()
-    assert page.kv_list.count() == 2
+    # 模型行默认预置（宿主机路径为空 = 不挂载），共 1 行
+    assert page.mount_table.rowCount() == 1
+    assert page.mount_table.item(0, 0).text() == "模型"
 
-    page.model_host.edit.setText("/data/models/Qwen3")
-    page.model_container.setText("/models")
-    page._extra_add()
-    page.extra_table.item(0, 0).setText("/workspace/logs")
-    page.extra_table.item(0, 1).setText("/logs")
+    # KV Cache：容器内路径自动同路径锁定
+    page.mount_type.setCurrentIndex(0)
+    page.mount_host.edit.setText("/mnt/kvcache1")
+    page._mount_add()
+    page.mount_host.edit.setText("/mnt/kvcache2")
+    page._mount_add()
+    kv_row = [r for r in range(page.mount_table.rowCount())
+              if page.mount_table.item(r, 0).text() == "KV Cache"]
+    assert len(kv_row) == 2
+    for r in kv_row:
+        assert page.mount_table.item(r, 2).text() == \
+            page.mount_table.item(r, 1).text(), "KV 行容器内路径=宿主机路径"
+        assert not (page.mount_table.item(r, 2).flags() & Qt.ItemIsEditable), \
+            "KV 行容器内路径应锁定不可编辑"
+
+    # 模型：编辑预置行
+    model_row = next(r for r in range(page.mount_table.rowCount())
+                     if page.mount_table.item(r, 0).text() == "模型")
+    page.mount_table.item(model_row, 1).setText("/data/models/Qwen3")
+    page.mount_table.item(model_row, 2).setText("/models")
+
+    # 自定义挂载
+    page.mount_type.setCurrentIndex(2)
+    page.mount_host.edit.setText("/workspace/logs")
+    page.mount_container.setText("/logs")
+    page._mount_add()
+
+    # 模型行重复添加被拦截
+    page.mount_type.setCurrentIndex(1)
+    page.mount_host.edit.setText("/data/other")
+    page._mount_add()
     qapp.processEvents()
 
     page._regen()
@@ -779,6 +851,125 @@ def test_container_page_kv_and_mounts(qapp, tmp_path):
     assert "-v /mnt/kvcache2:/mnt/kvcache2" in cmd
     assert "-v /data/models/Qwen3:/models:ro" in cmd
     assert "-v /workspace/logs:/logs" in cmd
+
+    # 删除选中行后命令不再包含该挂载
+    page.mount_table.selectRow(kv_row[0])
+    page._mount_del()
+    page._regen()
+    cmd = page.command_text()
+    assert "/mnt/kvcache1" not in cmd
+    assert "-v /mnt/kvcache2:/mnt/kvcache2" in cmd
+
+
+def test_container_page_mount_check_selected(qapp, tmp_path, fake_ssh, monkeypatch):
+    """挂载校验按选中行：KV 行间同文件系统硬判断；模型/自定义行只报信息。"""
+    from PySide6.QtCore import QItemSelectionModel
+    from PySide6.QtWidgets import QMessageBox
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    # fake_ssh 按 LIFO 匹配（后注册优先）：generic 兜底脚本须最先注册
+    fake_ssh.add_default(r"df --output",
+                         stdout="Device\tType\n/dev/sdc1\tnfs\n")
+    fake_ssh.add_default(r"df --output.*kvcache1",
+                         stdout="Device\tType\n/dev/sda1\text4\n")
+    fake_ssh.add_default(r"df --output.*kvcache2",
+                         stdout="Device\tType\n/dev/sdb1\text4\n")
+
+    boxes = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda *a, **k: (boxes.append(a[2] if len(a) > 2 else ""),
+                                      QMessageBox.StandardButton.Ok)[1]))
+    monkeypatch.setattr(
+        QMessageBox, "exec",
+        lambda self, *a, **k: (boxes.append(self.text()),
+                               QMessageBox.StandardButton.Ok)[1])
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [s]
+    page = ContainerPage(ctx)
+    page._add_mount_row("KV Cache", "/mnt/kvcache1", "/mnt/kvcache1",
+                        False, lock_container=True)
+    page._add_mount_row("KV Cache", "/mnt/kvcache2", "/mnt/kvcache2",
+                        False, lock_container=True)
+    page._add_mount_row("自定义", "/data/other", "/other", False)
+
+    def wait_quick():
+        import time as _t
+        deadline = _t.time() + 15
+        while page._quick_tasks and _t.time() < deadline:
+            qapp.processEvents()
+            _t.sleep(0.05)
+        qapp.processEvents()
+
+    # 未选中任何行 → 提示先选择
+    page._kv_check()
+    assert any("选中" in b for b in boxes), boxes
+
+    # 选中两个 KV 行但位于不同文件系统 → 失败
+    sel = page.mount_table.selectionModel()
+    sel.select(page.mount_table.model().index(1, 0),
+               QItemSelectionModel.Select | QItemSelectionModel.Rows)
+    sel.select(page.mount_table.model().index(2, 0),
+               QItemSelectionModel.Select | QItemSelectionModel.Rows)
+    page._kv_check()
+    wait_quick()
+    assert any("不在同一文件系统" in b for b in boxes), boxes
+
+    # 选中 KV1 + 自定义行：KV 单行不触发同源判断；自定义行只报文件系统信息
+    boxes.clear()
+    sel.select(page.mount_table.model().index(2, 0),
+               QItemSelectionModel.Deselect | QItemSelectionModel.Rows)
+    sel.select(page.mount_table.model().index(3, 0),
+               QItemSelectionModel.Select | QItemSelectionModel.Rows)
+    page._kv_check()
+    wait_quick()
+    assert any("位于 /dev/sdc1" in b for b in boxes), boxes
+    assert not any("不在同一文件系统" in b for b in boxes), boxes
+
+
+def test_task_panel_export_log(qapp, tmp_path, fake_ssh, monkeypatch):
+    """任务记录「⬇ 导出日志」：当前页签日志导出为 UTF-8 文件；空日志被拦截。"""
+    from PySide6.QtWidgets import QFileDialog
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.gui.widgets.common import ParallelTaskPanel
+
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    panel = ParallelTaskPanel()
+
+    # 无任务初始态：常驻「日志」占位页填满空白，空表格与等待条隐藏
+    fresh = ParallelTaskPanel()
+    assert fresh.tabs.count() == 1
+    assert fresh.tabs.tabText(0) == "日志"
+    assert fresh.table.isHidden()
+    assert fresh.compact_bar.isHidden()
+
+    def fn(ssh, tctx):
+        tctx.log("hello-export-line")
+
+    panel.run_tasks([(s, fn)], "导出测试")
+    assert _wait_panel(panel, qapp), "导出测试任务超时"
+
+    target = tmp_path / "out.log"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        staticmethod(lambda *a, **k: (str(target), "")))
+    panel.export_btn.click()
+    assert target.exists(), "应写出日志文件"
+    content = target.read_text(encoding="utf-8")
+    assert "hello-export-line" in content
+    assert "导出测试" in (panel.title_label.text())
+
+    # 空日志（无任务）：拦截提示，不弹文件选择框、不写文件
+    empty = ParallelTaskPanel()
+    empty.export_btn.click()
+    assert not target.exists() or "hello-export-line" in content
 
 
 # ============================================================ 步骤4：环境预检
@@ -821,7 +1012,9 @@ def test_precheck_page_intercepts_and_labels(qapp, tmp_path):
 
     ctx.containers = {s.id: "ucm-vllm"}
     page.on_enter()
-    assert "ucm-vllm" in page.container_label.text()
+    # 已选容器：下拉框回显名字，重复的状态提示行隐藏
+    assert page.container_combo.currentText() == "ucm-vllm"
+    assert page.container_label.isHidden()
     # 带宽开启但未填挂载目录 -> 拦截
     page._run()
     qapp.processEvents()
@@ -832,11 +1025,12 @@ def test_precheck_page_intercepts_and_labels(qapp, tmp_path):
     qapp.processEvents()
     assert page.result_table.rowCount() == 0
 
-    # 关闭带宽检查：挂载目录禁用并清空，不校验目录
+    # 关闭带宽检查：挂载目录与浏览按钮禁用（已填路径保留），不校验目录
     page.bandwidth_check.setChecked(False)
     qapp.processEvents()
     assert not page.mount_edit.isEnabled()
-    assert page.mount_edit.text() == ""
+    assert not page.mount_btn.isEnabled()
+    assert page.mount_edit.text() == "relative/path"
 
 
 def test_precheck_page_explicitly_selects_existing_container(qapp, tmp_path, fake_ssh):
@@ -905,14 +1099,16 @@ def test_precheck_page_runs_and_shows_result(qapp, tmp_path, fake_ssh):
     assert _wait_panel(page.panel, qapp), "预检任务超时"
     qapp.processEvents()
 
-    # 结果表格：5 个检查项；摘要列只放首行摘要
-    assert page.result_table.rowCount() == 5
+    # 结果表格：5 个检查项 + 宿主机 SMMU 附加项（fake 无 dmesg 脚本 -> SKIP）
+    assert page.result_table.rowCount() == 6
     assert page.result_table.item(0, 0).text() == "INFO"
     assert page.result_table.item(1, 0).text() == "PASS"
     assert page.result_table.item(1, 1).text() == "内核版本（kernel）"
     assert page.result_table.item(1, 2).text() == "5.10.0"
     assert page.result_table.item(3, 0).text() == "FAIL"
     assert page.result_table.item(3, 1).text() == "加速器驱动（accelerator_driver）"
+    assert page.result_table.item(5, 0).text() == "SKIP"
+    assert "SMMU" in page.result_table.item(5, 1).text()
     # 摘要行：FAIL 判定为未通过
     assert "未通过" in page.summary_label.text()
     assert "FAILED" in page.summary_label.text()

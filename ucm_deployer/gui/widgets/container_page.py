@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -38,7 +37,7 @@ from ...core.models import DeviceType, UCMInfo, VolumeMount
 from ...core.ssh_client import SSHClient
 from ..state import AppContext
 from .common import (ParallelTaskPanel, QuickTask, RemoteDirDialog, combo_ref,
-                     fill_image_combo, setup_image_combo)
+                     attach_resize_grip, fill_image_combo, setup_image_combo)
 
 
 class _PathPickRow(QWidget):
@@ -87,13 +86,16 @@ class ContainerPage(QWidget):
         self._ascend_mounts: Optional[List[tuple]] = None
         self._ascend_devices_loading = False
 
-        # ---------- 1. UCM 镜像与容器参数（紧凑：两行）
+        # ---------- 1. UCM 镜像与容器参数
         top_box = QGroupBox("1. UCM 镜像与容器参数")
         self.image_combo = QComboBox()
         setup_image_combo(self.image_combo)
         self.image_combo.setMinimumWidth(420)
         self.image_combo.currentIndexChanged.connect(self._on_image_changed)
-        refresh_img_btn = QPushButton("🔄 刷新镜像")
+        self.image_combo.setToolTip(
+            "选择用于创建容器的 UCM 镜像：步骤2 构建的镜像，或服务器上已含 UCM 的镜像。\n"
+            "未列出请点「刷新」；选中后自动校验镜像内 UCM 安装情况。")
+        refresh_img_btn = QPushButton("🔄 刷新")
         refresh_img_btn.clicked.connect(self._refresh_images)
         self.ucm_check_label = QLabel("镜像 UCM：未校验")
         self.ucm_check_label.setProperty("role", "hint")
@@ -106,87 +108,98 @@ class ContainerPage(QWidget):
         self.ascend_device_label = QLabel("Ascend 设备节点：将按服务器实际存在情况自动映射")
         self.ascend_device_label.setProperty("role", "hint")
         self.ascend_device_label.setWordWrap(True)
+        self.ascend_device_label.setVisible(False)   # 仅 Ascend 服务器显示
 
         self.name_edit = QLineEdit("ucm-vllm")
+        self.name_edit.setToolTip("docker 容器名（--name）；步骤4 按此名找到容器进行预检")
         self.shm_edit = QLineEdit("512g")
-        self.net_edit = QLineEdit("host")
-        self.net_edit.setToolTip("docker run --net 参数（Ascend 容器使用；NVIDIA 容器固定 -p 端口映射）")
         self.shm_edit.setFixedWidth(90)
+        self.shm_edit.setToolTip(
+            "容器共享内存大小（--shm-size）；vLLM 张量并行需要大共享内存，默认 512g")
+        self.net_edit = QLineEdit("host")
         self.net_edit.setFixedWidth(110)
+        self.net_edit.setToolTip(
+            "host = 容器共享宿主机网络栈（Ascend 推理推荐）；\n"
+            "NVIDIA 容器自动改用端口映射，此项忽略")
 
         img_row = QHBoxLayout()
         img_row.addWidget(self.image_combo, 1)
         img_row.addWidget(refresh_img_btn)
+        img_form = QFormLayout()
+        img_form.addRow("UCM 镜像", img_row)
         params_row = QHBoxLayout()
         params_row.addWidget(QLabel("容器名"))
         params_row.addWidget(self.name_edit)
-        params_row.addWidget(QLabel("shm-size"))
+        params_row.addWidget(QLabel("共享内存"))
         params_row.addWidget(self.shm_edit)
-        params_row.addWidget(QLabel("网络(Ascend)"))
+        params_row.addWidget(QLabel("网络"))
         params_row.addWidget(self.net_edit)
         params_row.addStretch(1)
         top_layout = QVBoxLayout(top_box)
         top_layout.setSpacing(4)
-        top_layout.addLayout(img_row)
+        top_layout.addLayout(img_form)
         top_layout.addWidget(self.ucm_check_label)
         top_layout.addWidget(self.reuse_hint)
         top_layout.addWidget(self.ascend_device_label)
         top_layout.addLayout(params_row)
 
-        # ---------- 2. 挂载（KV Cache / 模型 / 自定义，合并一个分组）
+        # ---------- 2. 挂载（统一表：KV Cache / 模型 / 自定义，一套按钮）
         mount_box = QGroupBox("2. 挂载（KV Cache / 模型 / 自定义）")
-        self.kv_list = QListWidget()
-        self.kv_list.setMaximumHeight(72)
-        self.kv_list.setToolTip(
-            "KV Cache 目录列表（挂载到容器内相同路径）。\n"
-            "单机部署本地目录即可；多目录须位于同一文件系统。")
-        kv_add_row = _PathPickRow(self, "/mnt/kvcache...")
-        kv_add_btn = QPushButton("➕ 添加")
-        kv_del_btn = QPushButton("🗑 移除选中")
-        kv_check_btn = QPushButton("🔍 文件系统校验")
-        kv_add_btn.clicked.connect(self._kv_add)
-        kv_del_btn.clicked.connect(self._kv_del)
-        kv_check_btn.clicked.connect(self._kv_check)
 
-        self.model_host = _PathPickRow(self, "/data/models/...")
-        self.model_container = QLineEdit("/models")
-        self.model_ro = QCheckBox("只读")
-        self.model_ro.setChecked(True)
-        ex_add_btn = QPushButton("➕ 添加挂载")
-        ex_del_btn = QPushButton("🗑 删除选中")
-        ex_add_btn.clicked.connect(self._extra_add)
-        ex_del_btn.clicked.connect(self._extra_del)
-        self.extra_table = QTableWidget(0, 3)
-        self.extra_table.setHorizontalHeaderLabels(["宿主机路径", "容器内路径", "只读"])
-        self.extra_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.extra_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.extra_table.verticalHeader().setVisible(False)
-        self.extra_table.setMaximumHeight(96)
+        self.mount_type = QComboBox()
+        self.mount_type.addItems(["KV Cache", "模型", "自定义"])
+        self.mount_type.setToolTip(
+            "KV Cache：挂载到容器内相同路径（多目录须位于同一文件系统）\n"
+            "模型：模型文件目录（默认只读，表中最多一行）\n"
+            "自定义：其他任意目录映射")
+        self.mount_host = _PathPickRow(self, "/mnt/kvcache 或 /data/models/...")
+        self.mount_host.edit.textChanged.connect(self._sync_mount_container)
+        self.mount_container = QLineEdit()
+        self.mount_container.setPlaceholderText("容器内路径")
+        mount_add_btn = QPushButton("➕ 添加")
+        mount_add_btn.clicked.connect(self._mount_add)
+
+        self.mount_table = QTableWidget(0, 4)
+        self.mount_table.setHorizontalHeaderLabels(
+            ["类型", "宿主机路径", "容器内路径", "只读"])
+        self.mount_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.mount_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.mount_table.verticalHeader().setVisible(False)
+        self.mount_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.mount_table.setMaximumHeight(120)
+        self.mount_table.setToolTip(
+            "所有挂载类型共用本表，操作统一：上方输入后「➕ 添加」，选中行「🗑 移除」。\n"
+            "KV Cache 行容器内路径自动与宿主机相同（vLLM 按相同路径读取）。\n"
+            "「模型」行默认预置，可直接编辑；删除该行即不挂载模型。")
+        self._add_mount_row("模型", "", "/models", True)   # 预置模型行（宿主机路径为空=不挂载）
+
+        mount_del_btn = QPushButton("🗑 移除选中")
+        mount_check_btn = QPushButton("🔍 校验选中挂载")
+        mount_check_btn.setToolTip(
+            "按表格中选中的行校验（按住 Ctrl 可多选）：\n"
+            "· 通用：目录是否存在、位于什么文件系统（本地盘 / NFS / 3FS 等）\n"
+            "· 选中的多个 KV Cache 行：还要求位于同一文件系统"
+            "（vLLM 多目录 KV cache 的要求）\n"
+            "· 模型/自定义行：仅报告文件系统信息，无硬性要求")
+        mount_del_btn.clicked.connect(self._mount_del)
+        mount_check_btn.clicked.connect(self._kv_check)
 
         mount_layout = QVBoxLayout(mount_box)
         mount_layout.setSpacing(4)
-        kv_row = QHBoxLayout()
-        kv_row.addWidget(kv_add_row, 1)
-        kv_row.addWidget(kv_add_btn)
-        kv_row.addWidget(kv_del_btn)
-        kv_row.addWidget(kv_check_btn)
-        mount_layout.addLayout(kv_row)
-        mount_layout.addWidget(self.kv_list)
-        self.kv_add_row = kv_add_row
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("模型路径"), 0)
-        model_row.addWidget(self.model_host, 1)
-        model_row.addWidget(QLabel("→ 容器内"))
-        model_row.addWidget(self.model_container, 1)
-        model_row.addWidget(self.model_ro)
-        mount_layout.addLayout(model_row)
-        ex_row = QHBoxLayout()
-        ex_row.addWidget(QLabel("自定义挂载"))
-        ex_row.addWidget(ex_add_btn)
-        ex_row.addWidget(ex_del_btn)
-        ex_row.addStretch(1)
-        mount_layout.addLayout(ex_row)
-        mount_layout.addWidget(self.extra_table)
+        add_row = QHBoxLayout()
+        add_row.addWidget(QLabel("类型"))
+        add_row.addWidget(self.mount_type)
+        add_row.addWidget(self.mount_host, 1)      # 与表格列宽一致：宿主机 : 容器内 = 1 : 1
+        add_row.addWidget(QLabel("→ 容器内"))
+        add_row.addWidget(self.mount_container, 1)
+        add_row.addWidget(mount_add_btn)
+        mount_layout.addLayout(add_row)
+        mount_layout.addWidget(self.mount_table)
+        mount_btns = QHBoxLayout()
+        mount_btns.addWidget(mount_del_btn)
+        mount_btns.addWidget(mount_check_btn)
+        mount_btns.addStretch(1)
+        mount_layout.addLayout(mount_btns)
 
         # ---------- 3. docker run 命令（按钮在上，编辑框占余下空间）
         cmd_box = QGroupBox("3. docker run 命令（自动生成，可编辑后执行）")
@@ -204,6 +217,7 @@ class ContainerPage(QWidget):
         self.cmd_edit.setFont(font)
         self.cmd_edit.setPlaceholderText("点击「生成/刷新命令」生成 docker run 命令")
         self.cmd_edit.setMinimumHeight(110)
+        attach_resize_grip(self.cmd_edit)   # 右下角拖动调整高度
         self.cmd_edit.setToolTip(
             "自动识别服务器卡数并映射全部加速卡：\n"
             "NPU: 全部 /dev/davinci* 设备 + 驱动挂载 + --net=host\n"
@@ -214,10 +228,10 @@ class ContainerPage(QWidget):
         cmd_layout = QVBoxLayout(cmd_box)
         cmd_layout.setSpacing(4)
         btns = QHBoxLayout()
-        btns.addWidget(regen_btn)
-        btns.addWidget(create_btn)
-        btns.addWidget(check_ctr_btn)
+        btns.addWidget(regen_btn)          # 中间操作：生成/刷新
         btns.addStretch(1)
+        btns.addWidget(check_ctr_btn)      # 结果操作靠右：检查、创建
+        btns.addWidget(create_btn)
         cmd_layout.addLayout(btns)
         cmd_layout.addWidget(self.cmd_edit, 1)
 
@@ -225,7 +239,7 @@ class ContainerPage(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(12)              # 模块间留白，强化 1→2→3 顺序感
         layout.addWidget(top_box)
         layout.addWidget(mount_box)
         layout.addWidget(cmd_box, 1)
@@ -239,7 +253,7 @@ class ContainerPage(QWidget):
             self._ascend_devices = []
             self._ascend_mounts = []
             self._ascend_devices_loading = False
-            self.ascend_device_label.setText("Ascend 设备节点：未登录服务器")
+            self.ascend_device_label.setVisible(False)
             fill_image_combo(self.image_combo, [])
             self.ucm_check_label.setText("镜像 UCM：未登录服务器（请回步骤1勾选）")
             return
@@ -256,9 +270,7 @@ class ContainerPage(QWidget):
             self._ascend_devices = []
             self._ascend_mounts = []
             self._ascend_devices_loading = False
-            self.ascend_device_label.setText(
-                "Ascend 设备节点：不适用" if server is not None
-                else "Ascend 设备节点：未登录服务器")
+            self.ascend_device_label.setVisible(False)   # 非 Ascend 服务器不显示
             if regenerate_when_done:
                 self._regen()
             return
@@ -355,22 +367,27 @@ class ContainerPage(QWidget):
     # ------------------------------------------------------------ 命令生成
     def _build_config(self) -> ContainerCreateConfig:
         server = self.ctx.server
+        kv_dirs: List[str] = []
         model_mount = None
-        if self.model_host.text():
-            model_mount = VolumeMount(self.model_host.text(),
-                                      self.model_container.text().strip() or "/models",
-                                      self.model_ro.isChecked())
-        extra_mounts = []
-        for row in range(self.extra_table.rowCount()):
-            host = (self.extra_table.item(row, 0).text()
-                    if self.extra_table.item(row, 0) else "").strip()
-            cont = (self.extra_table.item(row, 1).text()
-                    if self.extra_table.item(row, 1) else "").strip()
-            ro_item = self.extra_table.item(row, 2)
+        extra_mounts: List[VolumeMount] = []
+        for row in range(self.mount_table.rowCount()):
+            def cell(r: int, c: int) -> str:
+                it = self.mount_table.item(r, c)
+                return it.text().strip() if it is not None else ""
+            mtype = cell(row, 0)
+            host = cell(row, 1)
+            cont = cell(row, 2)
+            ro_item = self.mount_table.item(row, 3)
             ro = ro_item is not None and ro_item.checkState() == Qt.Checked
-            if host and cont:
-                extra_mounts.append(VolumeMount(host, cont, ro))
-        kv_dirs = [self.kv_list.item(i).text() for i in range(self.kv_list.count())]
+            if not host:
+                continue
+            if mtype == "KV Cache":
+                kv_dirs.append(host)
+            elif mtype == "模型":
+                if model_mount is None:
+                    model_mount = VolumeMount(host, cont or "/models", ro)
+            else:
+                extra_mounts.append(VolumeMount(host, cont or host, ro))
         dev = self.ctx.device_of(server) if server else None
         privileged = any(
             node in ("/dev/ummu", "/dev/uburma")
@@ -408,62 +425,123 @@ class ContainerPage(QWidget):
     def command_text(self) -> str:
         return self.cmd_edit.toPlainText()
 
-    # ------------------------------------------------------------ kvcache
-    def _kv_add(self) -> None:
-        path = self.kv_add_row.text()
-        if not path.startswith("/"):
-            QMessageBox.warning(self, "参数错误", "请输入以 / 开头的绝对路径")
-            return
-        if path not in [self.kv_list.item(i).text() for i in range(self.kv_list.count())]:
-            self.kv_list.addItem(path)
+    # ------------------------------------------------------------ 挂载
+    def _add_mount_row(self, mtype: str, host: str, container: str,
+                       ro: bool, lock_container: bool = False) -> None:
+        """向统一挂载表添加一行；lock_container 用于 KV Cache 同路径锁定。"""
+        table = self.mount_table
+        row = table.rowCount()
+        table.insertRow(row)
+        t = QTableWidgetItem(mtype)
+        t.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        table.setItem(row, 0, t)
+        table.setItem(row, 1, QTableWidgetItem(host))
+        c = QTableWidgetItem(container)
+        if lock_container:
+            c.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        table.setItem(row, 2, c)
+        ro_item = QTableWidgetItem()
+        ro_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        ro_item.setCheckState(Qt.Checked if ro else Qt.Unchecked)
+        table.setItem(row, 3, ro_item)
 
-    def _kv_del(self) -> None:
-        item = self.kv_list.currentItem()
-        if item is not None:
-            self.kv_list.takeItem(self.kv_list.row(item))
+    def _sync_mount_container(self, text: str) -> None:
+        """KV Cache 类型：容器内路径自动跟随宿主机（同路径约定）。"""
+        if self.mount_type.currentIndex() == 0:
+            self.mount_container.setText(text.strip())
+
+    def _mount_add(self) -> None:
+        host = self.mount_host.text()
+        if not host.startswith("/"):
+            QMessageBox.warning(self, "参数错误", "宿主机路径必须是以 / 开头的绝对路径")
+            return
+        mtype = self.mount_type.currentText()
+        if mtype == "模型":
+            for r in range(self.mount_table.rowCount()):
+                if self.mount_table.item(r, 0).text() == "模型":
+                    QMessageBox.information(
+                        self, "提示", "模型挂载仅一行，请直接编辑表中已有的「模型」行")
+                    return
+            self._add_mount_row("模型", host,
+                                self.mount_container.text().strip() or "/models",
+                                True)
+        elif mtype == "KV Cache":
+            self._add_mount_row("KV Cache", host, host, False, lock_container=True)
+        else:
+            self._add_mount_row("自定义", host,
+                                self.mount_container.text().strip() or host, False)
+        self.mount_host.edit.clear()
+        self.mount_container.clear()
+
+    def _mount_del(self) -> None:
+        row = self.mount_table.currentRow()
+        if row >= 0:
+            self.mount_table.removeRow(row)
 
     def _kv_check(self) -> None:
-        dirs = [self.kv_list.item(i).text() for i in range(self.kv_list.count())]
-        if not dirs:
-            QMessageBox.information(self, "提示", "请先添加 kvcache 挂载目录")
-            return
+        """校验选中的挂载行（可多选，见按钮 tooltip）：
+
+        - 通用：目录存在性 + 所在文件系统（df 的 source/fstype）；
+        - 多个 KV Cache 行：额外要求同一文件系统（vLLM 多目录 KV cache 要求）；
+        - 模型/自定义行：仅报告文件系统信息，不做同源硬判断。
+        """
         server = self.ctx.server
         if server is None:
-            QMessageBox.information(self, "提示", "请先在步骤1勾选要登录的服务器")
+            QMessageBox.information(self, "提示", "请先在步骤1点选要登录的服务器")
+            return
+        rows = sorted({idx.row() for idx in
+                       self.mount_table.selectionModel().selectedRows()})
+        if not rows:
+            QMessageBox.information(
+                self, "提示", "请先在表格中选中要校验的挂载行（按住 Ctrl 可多选）")
+            return
+        kv_dirs: List[str] = []
+        other_dirs: List[str] = []
+        for r in rows:
+            t = self.mount_table.item(r, 0)
+            h = self.mount_table.item(r, 1)
+            if t is None or h is None or not h.text().strip():
+                continue
+            (kv_dirs if t.text() == "KV Cache" else other_dirs).append(
+                h.text().strip())
+        if not kv_dirs and not other_dirs:
+            QMessageBox.information(self, "提示", "选中行没有有效的宿主机路径")
             return
 
         def fn():
             with SSHClient(server) as ssh:
-                return check_shared_fs(ssh, dirs)
+                kv_report = check_shared_fs(ssh, kv_dirs) if kv_dirs else None
+                other_report = (check_shared_fs(ssh, other_dirs)
+                                if other_dirs else None)
+                return kv_report, other_report
 
-        def on_done(report, error):
-            if error is not None or report is None:
+        def on_done(result, error):
+            if error is not None or result is None:
                 QMessageBox.warning(self, "校验失败", str(error))
                 return
-            merged = evaluate_shared_fs(report.entries)
-            icon = QMessageBox.Information if merged.ok else QMessageBox.Warning
-            box = QMessageBox(icon, "文件系统校验",
-                              merged.message
-                              + ("\n\n" + "\n".join(merged.warnings)
-                                 if merged.warnings else ""))
+            kv_report, other_report = result
+            parts: List[str] = []
+            ok = True
+            if kv_report is not None:
+                merged = evaluate_shared_fs(kv_report.entries)
+                ok = ok and merged.ok
+                parts.append("【KV Cache】" + merged.message)
+                parts.extend(merged.warnings)
+            if other_report is not None:
+                errs = [e for e in other_report.entries if e.error]
+                if errs:
+                    ok = False
+                    parts.append("【目录异常】" + "；".join(
+                        f"{e.path} {e.error}" for e in errs))
+                else:
+                    parts.append("【模型/自定义】" + "；".join(
+                        f"{e.path} 位于 {e.source}（{e.fstype or '未知类型'}）"
+                        for e in other_report.entries))
+            icon = QMessageBox.Information if ok else QMessageBox.Warning
+            box = QMessageBox(icon, "挂载校验", "\n".join(parts))
             box.exec()
 
         self._run_quick(fn, on_done)
-
-    def _extra_add(self) -> None:
-        row = self.extra_table.rowCount()
-        self.extra_table.insertRow(row)
-        self.extra_table.setItem(row, 0, QTableWidgetItem("/host/path"))
-        self.extra_table.setItem(row, 1, QTableWidgetItem("/container/path"))
-        ro = QTableWidgetItem()
-        ro.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-        ro.setCheckState(Qt.Unchecked)
-        self.extra_table.setItem(row, 2, ro)
-
-    def _extra_del(self) -> None:
-        row = self.extra_table.currentRow()
-        if row >= 0:
-            self.extra_table.removeRow(row)
 
     # ------------------------------------------------------------ 镜像操作
     def _refresh_images(self) -> None:

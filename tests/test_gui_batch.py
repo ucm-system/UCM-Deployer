@@ -113,11 +113,11 @@ def test_main_window_has_batch_step(qapp):
     win = MainWindow()
     win.show()
     qapp.processEvents()
-    win.goto_step(4)
+    win.goto_step(5)
     qapp.processEvents()
-    assert win.current_step() == 4
+    assert win.current_step() == 5
     assert win.batch_page is not None
-    assert "批量部署" in win._nav_buttons[4].text()
+    assert "批量部署" in win._nav_buttons[5].text()
     win.close()
 
 
@@ -128,13 +128,15 @@ def test_batch_page_fits_one_screen(qapp, tmp_path):
     win.resize(1280, 860)
     win.show()
     qapp.processEvents()
-    win.goto_step(4)
+    win.goto_step(5)
     qapp.processEvents()
     page = win.batch_page
     available = win.centralWidget().height()
-    assert page.minimumSizeHint().height() <= available, \
-        f"步骤5 最小高度 {page.minimumSizeHint().height()}px 超过可用 {available}px"
+    # 挂载表加高后允许页面轻微滚动（QScrollArea 包装），只约束不要高得离谱
+    assert page.minimumSizeHint().height() <= available + 160, \
+        f"步骤5 最小高度 {page.minimumSizeHint().height()}px 超过可用 {available}px 太多"
     assert page.panel.height() >= 100
+    assert page.mount_table.minimumHeight() >= 150, "挂载表应有足够高度展示多行（含空行留白）"
     win.close()
 
 
@@ -198,12 +200,18 @@ def test_batch_page_template_export_import_roundtrip(qapp, tmp_path, monkeypatch
     page.recreate_check.setChecked(True)
     page.name_edit.setText("ucm-batch")
     page.shm_edit.setText("256g")
-    page.kv_edit.setText("/mnt/nvme1")
-    page._kv_add()
-    page.kv_edit.setText("/mnt/nvme2")
-    page._kv_add()
-    page.model_host_edit.setText("/data/models")
-    page.model_container_edit.setText("/models")
+    # 统一挂载表：KV Cache 两行 + 模型预置行 + 自定义一行
+    page.mount_type.setCurrentIndex(0)              # KV Cache
+    page.mount_host_edit.setText("/mnt/nvme1")
+    page._mount_add()
+    page.mount_host_edit.setText("/mnt/nvme2")
+    page._mount_add()
+    page.mount_table.item(0, 1).setText("/data/models")   # 模型预置行
+    page.mount_table.item(0, 2).setText("/models")
+    page.mount_type.setCurrentIndex(2)              # 自定义
+    page.mount_host_edit.setText("/mnt/share")
+    page.mount_container_edit.setText("/share")
+    page._mount_add()
     page.mount_edit.setText("/mnt/nvme1")
     page.custom_cfg_check.setChecked(True)
     page.custom_cfg_edit.setPlainText('{"bandwidth": {"workers": 16}}')
@@ -229,9 +237,24 @@ def test_batch_page_template_export_import_roundtrip(qapp, tmp_path, monkeypatch
     assert page2.recreate_check.isChecked() is True
     assert page2.name_edit.text() == "ucm-batch"
     assert page2.shm_edit.text() == "256g"
-    assert [page2.kv_list.item(i).text()
-            for i in range(page2.kv_list.count())] == ["/mnt/nvme1", "/mnt/nvme2"]
-    assert page2.model_host_edit.text() == "/data/models"
+
+    def _rows_of(pg, mtype):
+        return [r for r in range(pg.mount_table.rowCount())
+                if pg.mount_table.item(r, 0).text() == mtype]
+
+    kv_rows = _rows_of(page2, "KV Cache")
+    assert [page2.mount_table.item(r, 1).text()
+            for r in kv_rows] == ["/mnt/nvme1", "/mnt/nvme2"]
+    # KV 行容器内路径锁定为同路径
+    for r in kv_rows:
+        assert page2.mount_table.item(r, 2).text() == page2.mount_table.item(r, 1).text()
+    model_rows = _rows_of(page2, "模型")
+    assert len(model_rows) == 1
+    assert page2.mount_table.item(model_rows[0], 1).text() == "/data/models"
+    assert page2.mount_table.item(model_rows[0], 2).text() == "/models"
+    extra_rows = _rows_of(page2, "自定义")
+    assert [page2.mount_table.item(r, 1).text() for r in extra_rows] == ["/mnt/share"]
+    assert [page2.mount_table.item(r, 2).text() for r in extra_rows] == ["/share"]
     assert page2.mount_edit.text() == "/mnt/nvme1"
     assert page2.custom_cfg_check.isChecked() is True
     assert json.loads(page2.custom_cfg_edit.toPlainText()) == {
@@ -415,3 +438,44 @@ def test_batch_page_run_stage_subset_only_image(qapp, tmp_path, fake_ssh):
         cmds.extend(c.executed_command for c in client.channels)
     assert not any(c.startswith("docker run -itd") for c in cmds)
     assert not any("ucm-toolkit run precheck" in c for c in cmds)
+
+
+def test_edit_resize_grip(qapp, tmp_path):
+    """多行输入框右下角拖动手柄：拖动调整高度、三处配置框均已接入。"""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QPlainTextEdit
+
+    from ucm_deployer.gui.widgets.common import _EditGrip, attach_resize_grip
+
+    edit = QPlainTextEdit()
+    edit.setFixedHeight(60)
+    edit.resize(300, 60)
+    grip = attach_resize_grip(edit)
+    edit.show()
+    qapp.processEvents()
+    assert isinstance(grip, _EditGrip)
+    assert grip in edit.children()
+    assert grip.isVisible()
+
+    # 向下拖 60px -> 高度增大
+    QTest.mousePress(grip, Qt.LeftButton)
+    QTest.mouseMove(grip, QPoint(grip.width() // 2, grip.height() // 2 + 60))
+    QTest.mouseRelease(grip, Qt.LeftButton)
+    qapp.processEvents()
+    assert edit.height() >= 100
+
+    # 向上拖 300px -> 受 MIN_H 限制
+    QTest.mousePress(grip, Qt.LeftButton)
+    QTest.mouseMove(grip, QPoint(grip.width() // 2, grip.height() // 2 - 300))
+    QTest.mouseRelease(grip, Qt.LeftButton)
+    qapp.processEvents()
+    assert edit.height() == _EditGrip.MIN_H
+
+    # 步骤5 两个配置框均已接入（步骤3 cmd_edit 由 smoke 用例覆盖构造路径）
+    from ucm_deployer.gui.widgets.batch_page import BatchPage
+
+    bp = BatchPage(make_ctx(tmp_path))
+    for w in (bp.extra_args_edit, bp.custom_cfg_edit):
+        assert any(isinstance(c, _EditGrip) for c in w.children()), \
+            "配置框应有拖动手柄"
