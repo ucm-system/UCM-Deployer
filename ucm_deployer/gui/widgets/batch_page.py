@@ -21,7 +21,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -59,10 +60,21 @@ from ...core.batch_deploy import (
     upsert_servers_from_template,
 )
 from ...core.docker_manager import DockerManager, validate_image_ref
+from ...core.device_detector import summarize_env_status
 from ...core.models import ServerInfo, VolumeMount
 from ...core.shell import shq
 from ..state import AppContext
 from .common import ParallelTaskPanel, attach_resize_grip
+
+# 自定义预检配置默认模板（叠加于 ucm-toolkit 出厂默认之上，只需写要覆盖的键；
+# 常用键参考 ucm-toolkit 出厂默认 precheck.defaults.json / 步骤4「预检参数配置」）
+DEFAULT_PRECHECK_TEMPLATE = """{
+  "kernel_min": "5.10",
+  "bandwidth": {
+    "workers": 8,
+    "threshold_gb": 8.0
+  }
+}"""
 
 
 class BatchPage(QWidget):
@@ -81,9 +93,23 @@ class BatchPage(QWidget):
         layout.setSpacing(10)              # 与步骤3/4 一致：模块间顺序感
         layout.addWidget(self._build_template_row())
         layout.addWidget(self._build_source_box())
-        layout.addWidget(self._build_targets_box(), 1)
-        layout.addWidget(self._build_config_box(), 1)
-        layout.addWidget(self._build_run_box(), 1)
+
+        # 上半（目标服务器 + 配置模板）与下半（批量执行 + 任务面板）可拖分栏：
+        # 任务启动后进度表 + 各服务器日志需要更多高度，固定 stretch 互相挤压
+        # 会把目标服务器列表压到只剩一行
+        upper = QWidget()
+        upper_lay = QVBoxLayout(upper)
+        upper_lay.setContentsMargins(0, 0, 0, 0)
+        upper_lay.setSpacing(10)
+        upper_lay.addWidget(self._build_targets_box(), 1)
+        upper_lay.addWidget(self._build_config_box(), 2)
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(upper)
+        splitter.addWidget(self._build_run_box())
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 4)
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, 1)
 
         self._update_target_count()
 
@@ -152,19 +178,26 @@ class BatchPage(QWidget):
         clear_btn.clicked.connect(lambda: self._set_all_targets(False))
         refresh_btn.clicked.connect(self.refresh_servers)
 
-        self.target_table = QTableWidget(0, 5)
-        self.target_table.setHorizontalHeaderLabels(["部署", "名称", "地址", "用户", "设备"])
+        self.target_table = QTableWidget(0, 6)
+        self.target_table.setHorizontalHeaderLabels(
+            ["部署", "名称", "地址", "用户", "设备", "环境"])
         header = self.target_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.target_table.horizontalHeaderItem(5).setToolTip(
+            "步骤1「探测设备」时宿主机环境预检的汇总结果：\n"
+            "PASS=全部通过（可放心用于批量部署）；WARN=有建议关注项；\n"
+            "FAIL=有不满足项（建议先修复）；未探测=尚未执行步骤1「探测设备」")
         self.target_table.verticalHeader().setVisible(False)
         self.target_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.target_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.target_table.setAlternatingRowColors(True)
-        self.target_table.setMaximumHeight(126)
+        # 至少可见 3 行目标服务器（旧版 max=126 且被任务面板挤压后只剩 1 行）
+        self.target_table.setMinimumHeight(120)
         self.target_table.itemChanged.connect(self._on_target_item_changed)
 
         self.target_count_label = QLabel("已选 0 台")
@@ -252,8 +285,7 @@ class BatchPage(QWidget):
         self.mount_table.setToolTip(
             "所有挂载类型共用本表：上方输入后「➕ 添加」，选中行「🗑 移除」。\n"
             "KV Cache 行容器内路径自动与宿主机相同（锁定不可改）。\n"
-            "「模型」行默认预置，可直接编辑；删除该行即不挂载模型。")
-        self._add_mount_row("模型", "", "/models", True)   # 预置模型行（空路径=不挂载）
+            "默认表为空（即不挂载任何目录）；需要挂载模型时选择类型后添加。")
         mount_del_btn = QPushButton("🗑 移除选中")
         mount_del_btn.clicked.connect(self._mount_del)
 
@@ -280,6 +312,61 @@ class BatchPage(QWidget):
         self.extra_args_edit.setFont(font)
         lay.addWidget(extra_args_label)
         lay.addWidget(self.extra_args_edit)
+
+        # ---- 自定义 docker run 命令（可选；所有目标使用同一条）
+        self.custom_cmd_check = QCheckBox(
+            "自定义 docker run 命令（所有目标使用同一条，跳过逐台设备适配）")
+        self.custom_cmd_check.setToolTip(
+            "勾选后批量部署直接执行下方命令，不再按每台服务器现场探测结果"
+            "生成命令。\n适合设备完全一致的同构集群；异构集群请保持不勾选。\n"
+            "命令中可写 {image} 占位符，执行时自动替换为所选镜像；"
+            "容器名请与上方「容器名」保持一致（用于同名容器检测与状态确认）。")
+        self.custom_cmd_edit = QPlainTextEdit()
+        self.custom_cmd_edit.setEnabled(False)
+        self.custom_cmd_edit.setFixedHeight(84)
+        attach_resize_grip(self.custom_cmd_edit)
+        self.custom_cmd_edit.setFont(font)
+        self.custom_cmd_edit.setPlaceholderText(
+            "docker run -itd --name ucm-vllm --entrypoint /bin/bash \\\n"
+            "    --net=host --shm-size 512g \\\n"
+            "    --device /dev/davinci0 ... --device /dev/davinci7 \\\n"
+            "    -v /mnt/kvcache:/mnt/kvcache \\\n"
+            "    {image}")
+        self.custom_cmd_generate_btn = QPushButton("🔁 生成命令样例")
+        self.custom_cmd_generate_btn.setEnabled(False)
+        self.custom_cmd_generate_btn.setToolTip(
+            "按当前配置（容器名/参数/挂载表）生成 Ascend 形态的命令样例，"
+            "设备段为通用形态，请按实际集群修改。")
+        self.custom_cmd_generate_btn.clicked.connect(
+            self._generate_custom_command)
+        gen_row = QHBoxLayout()
+        gen_row.addWidget(self.custom_cmd_generate_btn)
+        self.custom_cmd_note = QLabel(
+            "命令中的 {image} 占位符执行时替换为所选镜像")
+        gen_row.addWidget(self.custom_cmd_note, 0)
+        gen_row.addStretch(1)
+        hint_label = QLabel("自定义命令整条执行，跳过逐台设备适配；"
+                            "容器名与上方「容器名」一致")
+        hint_label.setProperty("role", "hint")
+        # 默认收起（一屏友好）：勾选后才展开命令编辑区
+        self.custom_cmd_widgets = [
+            self.custom_cmd_edit, self.custom_cmd_generate_btn,
+            self.custom_cmd_note, hint_label]
+        for w in self.custom_cmd_widgets:
+            w.setVisible(False)
+        self.custom_cmd_check.toggled.connect(self.custom_cmd_edit.setEnabled)
+        self.custom_cmd_check.toggled.connect(
+            self.custom_cmd_generate_btn.setEnabled)
+
+        def _toggle_custom(show: bool) -> None:
+            for w in self.custom_cmd_widgets:
+                w.setVisible(show)
+
+        self.custom_cmd_check.toggled.connect(_toggle_custom)
+        lay.addWidget(self.custom_cmd_check)
+        lay.addWidget(self.custom_cmd_edit)
+        lay.addLayout(gen_row)
+        lay.addWidget(hint_label)
         return page
 
     def _build_precheck_tab(self) -> QWidget:
@@ -318,10 +405,11 @@ class BatchPage(QWidget):
 
         self.custom_cfg_edit = QPlainTextEdit()
         self.custom_cfg_edit.setPlaceholderText(
-            '{\n  "bandwidth": {"workers": 8}\n}\n（JSON，只需写要覆盖的键）')
+            '已预填常用配置模板，按需修改；JSON 只需写要覆盖的键')
         self.custom_cfg_edit.setFont(QFont("Consolas"))
         self.custom_cfg_edit.setFixedHeight(84)
         attach_resize_grip(self.custom_cfg_edit)   # 右下角拖动调整高度
+        self.custom_cfg_edit.setPlainText(DEFAULT_PRECHECK_TEMPLATE)
         self.custom_cfg_edit.textChanged.connect(self._validate_precheck_json)
         lay.addWidget(self.custom_cfg_edit)
         lay.addStretch(1)
@@ -354,6 +442,11 @@ class BatchPage(QWidget):
         stages_row.addWidget(self.run_btn)
 
         self.panel = ParallelTaskPanel()
+        # 批量页定制任务面板高度：进度表至少可见 2 行、超过 ~8 行滚动查看；
+        # 日志页签至少可见数行（通用面板默认 76px，多服务器日志只露 1-2 行）
+        self.panel.table.setMinimumHeight(96)
+        self.panel.table.setMaximumHeight(240)
+        self.panel.tabs.setMinimumHeight(136)
         lay = QVBoxLayout(box)
         lay.setSpacing(6)
         lay.addLayout(stages_row)
@@ -387,7 +480,7 @@ class BatchPage(QWidget):
         if not servers:
             # 空状态引导：与步骤1 的关系一目了然
             self.target_table.setRowCount(1)
-            self.target_table.setSpan(0, 0, 1, 5)
+            self.target_table.setSpan(0, 0, 1, 6)
             hint_item = QTableWidgetItem(
                 "尚未添加服务器——请回步骤1「服务器管理」添加，然后点「🔄 刷新」同步")
             hint_item.setFlags(Qt.ItemIsEnabled)
@@ -407,6 +500,7 @@ class BatchPage(QWidget):
             dev_item = QTableWidgetItem(server.display_device)
             dev_item.setToolTip(server.remark)
             self.target_table.setItem(row, 4, dev_item)
+            self.target_table.setItem(row, 5, self._make_env_item(server.id))
         self.target_table.itemChanged.connect(self._on_target_item_changed)
 
         self.source_combo.blockSignals(True)
@@ -425,6 +519,27 @@ class BatchPage(QWidget):
                     self.source_combo.setCurrentIndex(index)
         self.source_combo.blockSignals(False)
         self._update_target_count()
+
+    def _make_env_item(self, server_id: str) -> QTableWidgetItem:
+        """「环境」列单元格：步骤1 探测设备时环境预检的汇总状态
+        （PASS 绿 / WARN 橙 / FAIL 红 / 未探测灰；悬浮显示各项明细）。"""
+        env = self.ctx.env_results.get(server_id) or []
+        summary = summarize_env_status(env)
+        item = QTableWidgetItem(summary or "未探测")
+        item.setTextAlignment(Qt.AlignCenter)
+        if summary == "PASS":
+            item.setForeground(Qt.darkGreen)
+        elif summary == "WARN":
+            item.setForeground(QColor("#d97706"))
+        elif summary == "FAIL":
+            item.setForeground(Qt.red)
+        else:
+            item.setForeground(Qt.gray)
+        if env:
+            item.setToolTip("\n".join(
+                f"[{it.status}] {it.name}  {it.summary}".rstrip()
+                for it in env))
+        return item
 
     def _on_mode_changed(self) -> None:
         pull_mode = self.mode_combo.currentIndex() == 1
@@ -514,10 +629,9 @@ class BatchPage(QWidget):
         if mtype == "模型":
             for row in range(self.mount_table.rowCount()):
                 t_item = self.mount_table.item(row, 0)
-                if (t_item is not None and t_item.text() == "模型"
-                        and (self.mount_table.item(row, 1).text() or "").strip()):
+                if t_item is not None and t_item.text() == "模型":
                     QMessageBox.warning(self, "参数错误",
-                                        "「模型」挂载最多一行（直接编辑预置行即可）")
+                                        "「模型」挂载最多一行（直接编辑已有「模型」行即可）")
                     return
         cont = self.mount_container_edit.text().strip()
         if mtype == "KV Cache":
@@ -549,7 +663,7 @@ class BatchPage(QWidget):
             ro_item = self.mount_table.item(row, 3)
             ro = ro_item is not None and ro_item.checkState() == Qt.Checked
             if not host:
-                continue                     # 预置模型行空路径 = 不挂载模型
+                continue                     # 空路径行跳过（不参与挂载）
             if mtype == "KV Cache":
                 kv_dirs.append(host)
             elif mtype == "模型":
@@ -566,8 +680,38 @@ class BatchPage(QWidget):
             model_mount=model_mount,
             extra_mounts=extra_mounts,
             extra_args=self.extra_args_edit.toPlainText())
+        if self.custom_cmd_check.isChecked():
+            cfg.custom_command = self.custom_cmd_edit.toPlainText().strip()
         cfg.validate()
         return cfg
+
+    def _generate_custom_command(self) -> None:
+        """按当前配置生成 Ascend 形态的自定义命令样例（设备段为通用形态）。"""
+        name = self.name_edit.text().strip() or "ucm-vllm"
+        shm = self.shm_edit.text().strip() or "512g"
+        net = self.net_edit.text().strip() or "host"
+        mounts = self._build_container_template()
+        lines = [
+            f"docker run -itd --name {name} --entrypoint /bin/bash",
+            f"    --net={net} --shm-size {shm}",
+            "    --device /dev/davinci0 ... --device /dev/davinci7",
+            "    --device /dev/davinci_manager --device /dev/hisi_hdc",
+            "    --device /dev/ummu --device /dev/uburma --privileged=true",
+        ]
+        for d in mounts.kv_cache_dirs:
+            lines.append(f"    -v {d}:{d}")
+        if mounts.model_mount is not None:
+            ro = ":ro" if mounts.model_mount.readonly else ""
+            lines.append(f"    -v {mounts.model_mount.host_path}:"
+                         f"{mounts.model_mount.container_path}{ro}")
+        for m in mounts.extra_mounts:
+            ro = ":ro" if m.readonly else ""
+            lines.append(f"    -v {m.host_path}:{m.container_path}{ro}")
+        extra = self.extra_args_edit.toPlainText().strip()
+        if extra:
+            lines.append(f"    {extra}")
+        lines.append("    {image}")
+        self.custom_cmd_edit.setPlainText(" \\\n".join(lines))
 
     def _build_precheck_template(self) -> BatchPrecheckConfig:
         cfg = BatchPrecheckConfig(
@@ -693,25 +837,30 @@ class BatchPage(QWidget):
         self.shm_edit.setText(cfg.shm_size)
         self.net_edit.setText(cfg.network)
         self.ports_edit.setText(" ".join(cfg.ports))
-        # 统一挂载表回填：先预置空模型行，再按类型逐行填入
+        # 统一挂载表回填：按类型逐行填入（默认空表）
         self.mount_table.setRowCount(0)
-        self._add_mount_row("模型", "", "/models", True)
         for d in cfg.kv_cache_dirs:
             self._add_mount_row("KV Cache", d, d, False)
         if cfg.model_mount is not None:
-            self.mount_table.item(0, 1).setText(cfg.model_mount.host_path)
-            self.mount_table.item(0, 2).setText(cfg.model_mount.container_path)
-            self.mount_table.item(0, 3).setCheckState(
-                Qt.Checked if cfg.model_mount.readonly else Qt.Unchecked)
+            self._add_mount_row("模型", cfg.model_mount.host_path,
+                                cfg.model_mount.container_path,
+                                cfg.model_mount.readonly)
         for m in cfg.extra_mounts:
             self._add_mount_row("自定义", m.host_path, m.container_path, m.readonly)
         self.extra_args_edit.setPlainText(cfg.extra_args)
+        # 自定义命令回填：模板含非空命令时勾选并填入；否则取消勾选
+        has_custom = bool(cfg.custom_command.strip())
+        self.custom_cmd_check.setChecked(has_custom)
+        if has_custom:
+            self.custom_cmd_edit.setPlainText(cfg.custom_command)
 
         pre = tpl.precheck
         self.bandwidth_check.setChecked(pre.bandwidth_check)
         self.mount_edit.setText(pre.mount_path)
         self.custom_cfg_check.setChecked(pre.custom_config_enabled)
-        self.custom_cfg_edit.setPlainText(pre.custom_config_json)
+        # 模板里没写自定义配置时保留默认模板内容
+        if pre.custom_config_json.strip():
+            self.custom_cfg_edit.setPlainText(pre.custom_config_json)
         self._validate_precheck_json()
 
         self.stage_image_check.setChecked(tpl.stages.distribute_image)
@@ -733,6 +882,14 @@ class BatchPage(QWidget):
             validate_image_ref(image_ref)
         except Exception as exc:
             QMessageBox.warning(self, "参数错误", str(exc))
+            return
+        if self.custom_cmd_check.isChecked() and not (
+                self.custom_cmd_edit.toPlainText().strip()):
+            QMessageBox.warning(
+                self, "参数错误",
+                "已勾选「自定义 docker run 命令」但命令为空；"
+                "请填写命令或点「🔁 生成命令样例」后再修改，"
+                "或取消勾选改用自动生成")
             return
 
         mode = "pull" if self.mode_combo.currentIndex() == 1 else "tar"
@@ -762,7 +919,9 @@ class BatchPage(QWidget):
         self._tar_error = ""
 
         tasks: List[Tuple[ServerInfo, object]] = []
-        if mode == "tar":
+        # 源服务器只在「镜像包中转 + 需要分发」时才参与（docker save 很耗时；
+        # 只创建容器/预检时无需准备镜像包，否则源服务器进度长期卡住）
+        if mode == "tar" and stages.distribute_image:
             tasks.append((source, self._make_prepare_task(source, image_ref)))
         for server in servers:
             tasks.append((server, self._make_deploy_task(
@@ -770,7 +929,8 @@ class BatchPage(QWidget):
 
         self.run_btn.setEnabled(False)
         title = (f"批量部署（{len(servers)} 台目标"
-                 + ("，源服务器先准备镜像包" if mode == "tar" else "")
+                 + ("，源服务器先准备镜像包" if mode == "tar"
+                    and stages.distribute_image else "")
                  + "）")
         if not self.panel.run_tasks(tasks, title, on_finished=self._on_finished):
             self.run_btn.setEnabled(True)
@@ -832,51 +992,63 @@ class BatchPage(QWidget):
 
             docker = DockerManager(ssh)
 
-            # ---- 阶段1：镜像分发
-            if stages.distribute_image:
-                stage_progress("image", 2, "准备镜像...")
-                if mode == "pull":
-                    pull_image_on_target(
-                        docker, image_ref,
-                        progress=lambda p, m: stage_progress("image", p, m),
-                        log=tctx.log)
-                else:
-                    if not self._tar_ready.is_set():
-                        tctx.log("等待源服务器镜像包准备完成...")
-                    while not self._tar_ready.wait(timeout=0.2):
-                        if tctx.cancelled():
-                            raise BatchDeployError("已取消（等待镜像包）")
-                    if self._tar_error:
-                        raise BatchDeployError(
-                            f"源服务器镜像包准备失败: {self._tar_error}")
-                    if skip_existing and docker.image_exists(image_ref):
-                        report.image_skipped = True
-                        tctx.log(f"镜像 {image_ref} 已存在，跳过分发")
-                        stage_progress("image", 100, "镜像已存在，跳过分发")
-                    else:
-                        load_image_tar(
-                            ssh, docker, self._local_tar, image_ref,
+            try:
+                # ---- 阶段1：镜像分发
+                if stages.distribute_image:
+                    stage_progress("image", 2, "准备镜像...")
+                    if mode == "pull":
+                        pull_image_on_target(
+                            docker, image_ref,
                             progress=lambda p, m: stage_progress("image", p, m),
-                            log=tctx.log, cancelled=tctx.cancelled)
+                            log=tctx.log)
+                    else:
+                        if not self._tar_ready.is_set():
+                            tctx.log("等待源服务器镜像包准备完成...")
+                        while not self._tar_ready.wait(timeout=0.2):
+                            if tctx.cancelled():
+                                raise BatchDeployError("已取消（等待镜像包）")
+                        if self._tar_error:
+                            raise BatchDeployError(
+                                f"源服务器镜像包准备失败: {self._tar_error}")
+                        if skip_existing and docker.image_exists(image_ref):
+                            report.image_skipped = True
+                            tctx.log(f"镜像 {image_ref} 已存在，跳过分发")
+                            stage_progress("image", 100, "镜像已存在，跳过分发")
+                        else:
+                            load_image_tar(
+                                ssh, docker, self._local_tar, image_ref,
+                                progress=lambda p, m: stage_progress("image", p, m),
+                                log=tctx.log, cancelled=tctx.cancelled)
 
-            # ---- 阶段2：容器创建
-            if stages.create_container:
-                name, _cmd = create_container_from_template(
-                    ssh, docker, container_tpl, image_ref,
-                    progress=lambda p, m: stage_progress("container", p, m),
-                    log=tctx.log, recreate=recreate)
-                report.container = name
+                # ---- 阶段2：容器创建
+                if stages.create_container:
+                    name, _cmd = create_container_from_template(
+                        ssh, docker, container_tpl, image_ref,
+                        progress=lambda p, m: stage_progress("container", p, m),
+                        log=tctx.log, recreate=recreate,
+                        cancelled=tctx.cancelled)
+                    report.container = name
 
-            # ---- 阶段3：环境预检
-            if stages.run_precheck:
-                container = report.container or container_tpl.name
-                tctx.log(f"预检目标容器: {container}")
-                result = run_precheck_on_target(
-                    ssh, precheck_tpl, container,
-                    progress=lambda p, m: stage_progress("precheck", p, m),
-                    log=tctx.log)
-                report.precheck_summary = result.summary
-                report.precheck_verdict = result.verdict
+                # ---- 阶段3：环境预检
+                if stages.run_precheck:
+                    container = report.container or container_tpl.name
+                    tctx.log(f"预检目标容器: {container}")
+                    result = run_precheck_on_target(
+                        ssh, precheck_tpl, container,
+                        progress=lambda p, m: stage_progress("precheck", p, m),
+                        log=tctx.log, cancelled=tctx.cancelled)
+                    report.precheck_summary = result.summary
+                    report.precheck_verdict = result.verdict
+            except Exception as exc:
+                # 失败目标也记录报告：汇总弹窗能展示每台结果；
+                # 完整失败原因写入日志页签，状态栏/弹窗只提示查看日志
+                report.error = str(exc)
+                self._reports[server.id] = report
+                tctx.log(f"[deployer] ✗ 执行失败: {exc}")
+                if "取消" in str(exc):
+                    raise
+                raise BatchDeployError(
+                    "批量部署失败（详见该服务器日志页签）") from exc
 
             self._reports[server.id] = report
             tctx.progress(100, report.describe())
@@ -894,12 +1066,13 @@ class BatchPage(QWidget):
 
         lines = []
         failed_reports = [r for r in self._reports.values()
-                          if r.precheck_verdict == "failed"]
+                          if r.precheck_verdict == "failed" or r.error]
         for server in self._selected_targets():
             rep = self._reports.get(server.id)
             if rep is None:
                 continue
-            icon = ("✗" if rep.precheck_verdict == "failed" else "✓")
+            icon = ("✗" if (rep.precheck_verdict == "failed" or rep.error)
+                    else "✓")
             lines.append(f"{icon} {rep.server_name}: {rep.describe()}"
                          + (f"\n    {rep.precheck_summary}" if rep.precheck_summary
                             and rep.precheck_verdict == "failed" else ""))

@@ -43,6 +43,10 @@ def test_ascend_run_command(fake_ssh):
     assert "-v /usr/local/dcmi:/usr/local/dcmi" in cmd
     assert "-v /usr/local/Ascend/driver:/usr/local/Ascend/driver" in cmd
     assert "-v /etc/ascend_install.info:/etc/ascend_install.info" in cmd
+    # /usr/lib64 不再挂载：宿主机库覆盖容器内库会导致容器启动即退出
+    assert "/usr/lib64" not in cmd
+    # 950（A5）的 URMA 管理工具挂载（候选路径，宿主机存在才生成；只读）
+    assert "-v /usr/bin/urma_admin:/usr/bin/urma_admin:ro" in cmd
     assert "-v /mnt/nfs_share:/mnt/nfs_share" in cmd
     assert "-v /data/models/DeepSeek:/models:ro" in cmd
     assert "-v /home/user/logs:/logs" in cmd
@@ -111,6 +115,8 @@ def test_list_ascend_mounts_keeps_existing_a5_paths(fake_ssh):
     assert ("/usr/local/Ascend/driver", "/usr/local/Ascend/driver") in mounts
     assert ("/usr/local/sbin", "/usr/local/sbin") in mounts
     assert all(host in existing for host, _ in mounts)
+    # /usr/lib64 已从候选列表移除（挂载会导致容器启动即退出）
+    assert ("/usr/lib64", "/usr/lib64") not in mounts
 
 
 def test_ascend_a5_run_command_adds_privileged_and_mounts(fake_ssh):
@@ -130,6 +136,7 @@ def test_ascend_a5_run_command_adds_privileged_and_mounts(fake_ssh):
         system_mounts=[
             ("/usr/local/Ascend/driver", "/usr/local/Ascend/driver"),
             ("/usr/local/sbin", "/usr/local/sbin"),
+            ("/usr/bin/urma_admin", "/usr/bin/urma_admin"),
         ],
         privileged=True,
     )
@@ -138,6 +145,8 @@ def test_ascend_a5_run_command_adds_privileged_and_mounts(fake_ssh):
     assert "--device /dev/ummu" in cmd
     assert "--device /dev/uburma" in cmd
     assert "-v /usr/local/Ascend/driver:/usr/local/Ascend/driver" in cmd
+    # 950（A5）的 URMA 管理工具以只读方式挂载
+    assert "-v /usr/bin/urma_admin:/usr/bin/urma_admin:ro" in cmd
 
 
 # ============================================================ NVIDIA 模板
@@ -230,6 +239,27 @@ def test_create_rejects_trailing_bash_argument(fake_ssh):
         cm.create(
             "docker run -itd --entrypoint /bin/bash --name c1 img:1 bash")
     assert not ssh._client.channels
+
+
+def test_create_accepts_pasted_log_command(fake_ssh):
+    """直接粘贴日志中的多行命令（行尾「\\ 空格」续行 + 「$ 」前缀）也能执行：
+    修复前续行符带空格不被识别，残留的 \\ 会让 shell 解析出错误命令。"""
+    cm, ssh = make_cm(fake_ssh)
+    ssh._client.add(r"^docker run ", stdout="container-id-888\n")
+    pasted = (
+        "$ docker run -itd \\ \n"
+        "    --name c1 \\ \n"
+        "    --entrypoint /bin/bash \\ \n"
+        "    --shm-size 512g \\ \n"
+        "    img:1\n"
+    )
+    res = cm.create(pasted)
+    assert res.ok
+    executed = ssh._client.channels[-1].executed_command
+    assert "\\" not in executed and "\n" not in executed
+    assert executed.startswith("docker run -itd --name c1")
+    assert "--entrypoint /bin/bash" in executed
+    assert not executed.endswith("bash")
 
 
 def test_list_host_dirs(fake_ssh):

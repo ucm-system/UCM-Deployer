@@ -15,7 +15,19 @@
 - ✓ 已安装：显示版本，自动记录为本服务器使用的镜像；
 - ✗ 未安装：提示回步骤2 构建或换镜像（创建容器前会再次拦截确认）。
 
-### 2. 容器参数
+### 2. 挂载配置（统一挂载表）
+
+KV Cache / 模型 / 自定义挂载统一在同一张表格中维护（类型、宿主机路径、容器内路径、只读四列），共用一套「➕ 添加 / 🗑 移除选中」按钮；**默认表为空（即不挂载任何目录）**，需要时选择类型、填写路径后添加：
+
+- **KV Cache 行**：挂载到容器内相同路径（vLLM 按相同路径读取），「浏览」弹出**容器内/宿主机目录浏览器**；选中行「🔍 校验选中挂载」检查挂载点所在文件系统（KV Cache 要求同一文件系统）；
+- **模型行**：宿主机路径 → 容器内路径（默认 `/models`），默认只读，最多一行；
+- **自定义行**：任意宿主机/容器路径映射，可勾选只读。
+
+![目录浏览](../screenshots/dialog-remote-dirs.png)
+
+### 3. 容器配置与生成 / 执行命令
+
+容器参数（容器名 / 共享内存 / 网络）与 docker run 命令集中在同一模块配置：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -23,21 +35,12 @@
 | shm-size | `512g` | UCM KV-cache 页缓存要求 ≥512 GiB |
 | 网络 | `host` | Ascend 容器使用；NVIDIA 容器固定用 `-p 8000:8000` 端口映射 |
 
-### 3. 挂载配置
-
-- **KV Cache 目录**：可添加多个（「浏览」弹出**容器内/宿主机目录浏览器**）；挂载到容器内相同路径；「🔍 文件系统校验」检查目录所在文件系统（本地/网络存储）；
-- **模型路径**：宿主机路径 → 容器内路径（默认 `/models`），默认只读；
-- **自定义挂载**：任意宿主机/容器路径映射，可勾选只读。
-
-![目录浏览](../screenshots/dialog-remote-dirs.png)
-
-### 4. 生成 / 执行命令
-
 点「🔁 生成/刷新命令」自动生成 docker run。对 Ascend 服务器，工具会先探测宿主机实际存在的设备节点与驱动/工具/配置挂载，只生成存在的 `--device` 与 `-v` 参数：
 
 - 兼容 `Ascend950PR` / A5：没有 `/dev/devmm_svm` 时不会生成该参数；
 - 探测到 `/dev/ummu` 或 `/dev/uburma` 时自动添加 `--privileged=true`；
-- 自动包含实际存在的 `/usr/local/Ascend/driver`、`/etc/ascend_install.info`、`/etc/hccl_rootinfo.json`、`/etc/hixlep`、`/usr/local/dcmi`、`/usr/local/sbin`、`/usr/local/bin/npu-smi`、`/usr/lib64`、`/root/.cache` 等挂载。
+- 自动包含实际存在的 `/usr/local/Ascend/driver`、`/etc/ascend_install.info`、`/etc/hccl_rootinfo.json`、`/etc/hixlep`、`/usr/local/dcmi`、`/usr/local/sbin`、`/usr/local/bin/npu-smi`、`/usr/bin/urma_admin`（950 机型，只读）、`/root/.cache` 等挂载；
+- **不挂载 `/usr/lib64`**——宿主机动态库覆盖容器内库目录会导致容器启动即退出。
 
 === "NPU（vllm-ascend）"
 
@@ -57,7 +60,6 @@
         -v /usr/local/dcmi:/usr/local/dcmi \
         -v /usr/local/sbin:/usr/local/sbin \
         -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-        -v /usr/lib64:/usr/lib64 \
         -v /root/.cache:/root/.cache \
         -v /mnt/kvcache:/mnt/kvcache \
         -v /data/models/Qwen3-32B:/models:ro \

@@ -177,8 +177,11 @@ class ServerTaskThread(threading.Thread):
         ctx = TaskContext(self)
         try:
             with SSHClient(self.server) as ssh:
-                self.fn(ssh, ctx)
-            self.signals.sig_done.emit(self.server.id, True, "完成")
+                result = self.fn(ssh, ctx)
+            # 任务函数可返回状态消息（str）作为完成提示；否则用通用的「完成」
+            message = (result if isinstance(result, str) and result.strip()
+                       else "完成")
+            self.signals.sig_done.emit(self.server.id, True, message)
         except Exception as exc:
             self.signals.sig_done.emit(self.server.id, False, str(exc))
 
@@ -365,14 +368,15 @@ class ParallelTaskPanel(QWidget):
             return False
 
         def handler(all_ok: bool) -> None:
+            # 先断开自身再回调：on_finished 里可能弹模态框或启动新任务，
+            # 期间 finished_all 若再次发射，旧回调不能被重入
+            # （曾导致「构建完成」提示连环弹出）
             try:
-                if on_finished is not None:
-                    on_finished(all_ok)
-            finally:
-                try:
-                    self.finished_all.disconnect(handler)
-                except (RuntimeError, TypeError):
-                    pass
+                self.finished_all.disconnect(handler)
+            except (RuntimeError, TypeError):
+                pass
+            if on_finished is not None:
+                on_finished(all_ok)
 
         if on_finished is not None:
             self.finished_all.connect(handler)

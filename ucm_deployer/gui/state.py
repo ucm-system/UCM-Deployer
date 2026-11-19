@@ -16,6 +16,9 @@ class AppContext:
         # 步骤1：当前登录的服务器（至多一台）
         self.selected: List[ServerInfo] = []
         self.devices: Dict[str, DeviceInfo] = {}      # server_id -> DeviceInfo
+        # 步骤1 探测设备时的宿主机环境预检结果（server_id -> List[HostEnvItem]），
+        # 供步骤5 目标服务器表展示每台的可用状态
+        self.env_results: Dict[str, list] = {}
         # 步骤2：构建完成/选定的 UCM 镜像
         self.images: Dict[str, str] = {}              # server_id -> 镜像 ref
         # 步骤3：创建的容器名

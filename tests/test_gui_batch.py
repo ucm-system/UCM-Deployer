@@ -133,7 +133,8 @@ def test_batch_page_fits_one_screen(qapp, tmp_path):
     page = win.batch_page
     available = win.centralWidget().height()
     # 挂载表加高后允许页面轻微滚动（QScrollArea 包装），只约束不要高得离谱
-    assert page.minimumSizeHint().height() <= available + 160, \
+    # +175：自定义命令 checkbox 单行常驻的代价（其余编辑区勾选才展开）
+    assert page.minimumSizeHint().height() <= available + 175, \
         f"步骤5 最小高度 {page.minimumSizeHint().height()}px 超过可用 {available}px 太多"
     assert page.panel.height() >= 100
     assert page.mount_table.minimumHeight() >= 150, "挂载表应有足够高度展示多行（含空行留白）"
@@ -171,6 +172,46 @@ def test_batch_page_run_requires_targets(qapp, tmp_path):
     assert page._reports == {}
 
 
+def test_batch_page_env_column(qapp, tmp_path):
+    """「环境」列：步骤1 探测设备的环境预检汇总（PASS/WARN/FAIL/未探测），
+    悬浮提示含各项明细。"""
+    from ucm_deployer.core.device_detector import HostEnvItem
+
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 2)
+    page.ctx.env_results[servers[0].id] = [
+        HostEnvItem("kernel", "内核版本", "PASS", "5.10.0"),
+        HostEnvItem("accelerator_driver", "加速器驱动", "WARN",
+                    "HDK=24.1", "升级驱动"),
+        HostEnvItem("smmu", "SMMU 开关（宿主机）", "PASS", "未开启"),
+    ]
+    # FAIL 的服务器
+    page.ctx.env_results[servers[1].id] = [
+        HostEnvItem("kernel", "内核版本", "FAIL", "4.19.0", "升级内核"),
+    ]
+    page.refresh_servers()
+    qapp.processEvents()
+
+    warn_item = page.target_table.item(0, 5)
+    assert warn_item.text() == "WARN"
+    assert "内核版本" in warn_item.toolTip() and "5.10.0" in warn_item.toolTip()
+    fail_item = page.target_table.item(1, 5)
+    assert fail_item.text() == "FAIL"
+
+    # 未探测：灰色占位；探测结果随刷新更新
+    page.ctx.env_results.clear()
+    page.refresh_servers()
+    qapp.processEvents()
+    assert page.target_table.item(0, 5).text() == "未探测"
+
+    # 全 PASS 显示 PASS
+    page.ctx.env_results[servers[0].id] = [
+        HostEnvItem("kernel", "内核版本", "PASS", "5.10.0")]
+    page.refresh_servers()
+    qapp.processEvents()
+    assert page.target_table.item(0, 5).text() == "PASS"
+
+
 def test_batch_page_on_enter_prefills_from_context(qapp, tmp_path):
     page = make_page(qapp, tmp_path)
     servers = add_servers(page.ctx, 1)
@@ -200,14 +241,16 @@ def test_batch_page_template_export_import_roundtrip(qapp, tmp_path, monkeypatch
     page.recreate_check.setChecked(True)
     page.name_edit.setText("ucm-batch")
     page.shm_edit.setText("256g")
-    # 统一挂载表：KV Cache 两行 + 模型预置行 + 自定义一行
+    # 统一挂载表：KV Cache 两行 + 模型一行 + 自定义一行（默认空表，逐行添加）
     page.mount_type.setCurrentIndex(0)              # KV Cache
     page.mount_host_edit.setText("/mnt/nvme1")
     page._mount_add()
     page.mount_host_edit.setText("/mnt/nvme2")
     page._mount_add()
-    page.mount_table.item(0, 1).setText("/data/models")   # 模型预置行
-    page.mount_table.item(0, 2).setText("/models")
+    page.mount_type.setCurrentIndex(1)              # 模型
+    page.mount_host_edit.setText("/data/models")
+    page.mount_container_edit.setText("/models")
+    page._mount_add()
     page.mount_type.setCurrentIndex(2)              # 自定义
     page.mount_host_edit.setText("/mnt/share")
     page.mount_container_edit.setText("/share")
@@ -267,6 +310,45 @@ def test_batch_page_template_export_import_roundtrip(qapp, tmp_path, monkeypatch
     assert page2._selected_source().host == servers[0].host
 
 
+def test_batch_page_precheck_default_template(qapp, tmp_path):
+    """自定义预检配置编辑框预填默认模板（合法 JSON，含常用键）。"""
+    from ucm_deployer.gui.widgets.batch_page import DEFAULT_PRECHECK_TEMPLATE
+
+    page = make_page(qapp, tmp_path)
+    assert json.loads(page.custom_cfg_edit.toPlainText()) == \
+        json.loads(DEFAULT_PRECHECK_TEMPLATE)
+    assert "bandwidth" in json.loads(page.custom_cfg_edit.toPlainText())
+
+
+def test_batch_page_import_empty_custom_cfg_keeps_default(
+        qapp, tmp_path, monkeypatch):
+    """导入的部署模板未写自定义配置时，编辑框保留默认模板内容。"""
+    from PySide6.QtWidgets import QFileDialog
+
+    from ucm_deployer.gui.widgets.batch_page import (
+        DEFAULT_PRECHECK_TEMPLATE, BatchPage)
+
+    page = make_page(qapp, tmp_path)
+    path = str(tmp_path / "tpl.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (path, "")))
+    page._export_template()
+    assert os.path.isfile(path)
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["precheck"]["custom_config_json"] = ""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+
+    page2 = BatchPage(make_ctx(tmp_path))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (path, "")))
+    page2._import_template()
+    qapp.processEvents()
+    assert json.loads(page2.custom_cfg_edit.toPlainText()) == \
+        json.loads(DEFAULT_PRECHECK_TEMPLATE)
+
+
 def test_batch_page_import_template_bad_file(qapp, tmp_path, monkeypatch):
     from PySide6.QtWidgets import QFileDialog
 
@@ -305,6 +387,7 @@ def _script_common(fake_ssh):
                          stdout="/usr/local/Ascend/driver\n")
     fake_ssh.add_default(r"docker run --rm", stdout="uc-manager==1.2.3\n")
     fake_ssh.add_default(r"^docker run -itd", stdout="container-id\n")
+    fake_ssh.add_default(r"^docker inspect", stdout="running|0\n")
     fake_ssh.add_default(r"ucm-toolkit run precheck", stdout=_PRECHECK_OUT)
 
 
@@ -438,6 +521,80 @@ def test_batch_page_run_stage_subset_only_image(qapp, tmp_path, fake_ssh):
         cmds.extend(c.executed_command for c in client.channels)
     assert not any(c.startswith("docker run -itd") for c in cmds)
     assert not any("ucm-toolkit run precheck" in c for c in cmds)
+
+
+def test_batch_page_custom_command_requires_text(qapp, tmp_path):
+    """勾选自定义命令但内容为空：部署前拦截（不启动任务）。"""
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 1)
+    page.refresh_servers()
+    check_target(page, servers[0], qapp)
+    page.image_ref_edit.setText("ucm-vllm:0.4.0")
+    page.custom_cmd_check.setChecked(True)     # 展开编辑区但保持为空
+    page._run()
+    assert not page.panel.is_running()         # 被拦截
+
+
+def test_batch_page_custom_command_mode(qapp, tmp_path, fake_ssh):
+    """勾选自定义命令：整条命令执行（{image} 已替换），跳过逐台设备探测。"""
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 1)
+    page.refresh_servers()
+    check_target(page, servers[0], qapp)
+    fake_ssh.add_default(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    fake_ssh.add_default(r"docker ps", stdout="")
+    fake_ssh.add_default(r"^docker run -itd", stdout="container-id\n")
+
+    page.image_ref_edit.setText("ucm-vllm:0.4.0")
+    page.stage_image_check.setChecked(False)
+    page.custom_cmd_check.setChecked(True)
+    page.custom_cmd_edit.setPlainText(
+        "docker run -itd --name my-ctr --entrypoint /bin/bash "
+        "-v /mnt/kv:/mnt/kv {image}")
+    page._run()
+    assert _wait_panel(page.panel, qapp)
+    rep = page._reports[servers[0].id]
+    assert rep.container == "my-ctr"
+
+    cmds = []
+    for client in fake_ssh.instances:
+        cmds.extend(c.executed_command for c in client.channels)
+    assert any("ucm-vllm:0.4.0" in c and "my-ctr" in c for c in cmds)
+    # 未发生设备探测（无 uname/npu-smi 脚本也成功）
+    assert not any("npu-smi info" in c for c in cmds)
+
+
+def test_batch_page_run_container_precheck_no_source_task(qapp, tmp_path, fake_ssh):
+    """tar 模式仅勾「容器创建 + 环境预检」：源服务器不参与执行（修复前
+    源服务器仍会 docker save 整个镜像，进度长期卡住且阻塞重新部署）。"""
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 2)
+    page.refresh_servers()
+    page.source_combo.setCurrentIndex(page._source_index_of(servers[0].id))
+    check_target(page, servers[1], qapp)
+
+    fake_ssh.add_default(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    fake_ssh.add_default(r"^uname -m", stdout="aarch64\n")
+    fake_ssh.add_default(r"^npu-smi info", stdout=_NPU_SMI)
+    fake_ssh.add_default(r"for d in /dev/davinci", stdout="/dev/davinci0\n")
+    fake_ssh.add_default(r"for p in /usr/local",
+                         stdout="/usr/local/Ascend/driver\n")
+    fake_ssh.add_default(r"^docker run -itd", stdout="container-id\n")
+    fake_ssh.add_default(r"ucm-toolkit run precheck", stdout=_PRECHECK_OUT)
+
+    page.image_ref_edit.setText("ucm-vllm:0.4.0")
+    page.stage_image_check.setChecked(False)
+    page._run()
+    assert _wait_panel(page.panel, qapp)
+
+    rep = page._reports[servers[1].id]
+    assert rep.container == "ucm-vllm"
+    assert rep.precheck_verdict in ("passed", "completed")
+    cmds = []
+    for client in fake_ssh.instances:
+        cmds.extend(c.executed_command for c in client.channels)
+    assert not any("docker save" in c for c in cmds)
+    assert not any("bash -c" in c for c in cmds)
 
 
 def test_edit_resize_grip(qapp, tmp_path):

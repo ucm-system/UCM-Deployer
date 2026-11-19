@@ -75,14 +75,16 @@ class DockerManager:
         return res.ok
 
     def pull_image(self, ref: str, platform: str = "",
-                   on_line: Optional[Callable[[str], None]] = None) -> str:
+                   on_line: Optional[Callable[[str], None]] = None,
+                   cancelled: Optional[Callable[[], bool]] = None) -> str:
         """在目标服务器上拉取镜像；本地无需安装 Docker。"""
         ref = validate_image_ref(ref)
         cmd = "docker pull"
         if platform:
             cmd += f" --platform {shq(platform)}"
         cmd += f" {shq(ref)}"
-        res = self.ssh.exec_stream(cmd, on_line=on_line, timeout=7200)
+        res = self.ssh.exec_stream(cmd, on_line=on_line, timeout=7200,
+                                   cancelled=cancelled)
         if not res.ok:
             raise DockerError(
                 f"服务器 docker pull 失败(退出码 {res.exit_code}): "
@@ -92,10 +94,12 @@ class DockerManager:
         return ref
 
     def load_image(self, remote_tar: str,
-                   on_line: Optional[Callable[[str], None]] = None) -> List[str]:
+                   on_line: Optional[Callable[[str], None]] = None,
+                   cancelled: Optional[Callable[[], bool]] = None) -> List[str]:
         """docker load 并解析加载出的镜像引用列表。"""
         res = self.ssh.exec_stream(f"docker load -i {shq(remote_tar)}",
-                                   on_line=on_line, timeout=3600)
+                                   on_line=on_line, timeout=3600,
+                                   cancelled=cancelled)
         if not res.ok:
             raise DockerError(f"docker load 失败: {res.stderr.strip()[:300]}")
         refs = []
@@ -105,7 +109,8 @@ class DockerManager:
         return refs
 
     def save_image(self, ref: str, remote_path: str,
-                   on_line: Optional[Callable[[str], None]] = None) -> None:
+                   on_line: Optional[Callable[[str], None]] = None,
+                   cancelled: Optional[Callable[[], bool]] = None) -> None:
         """docker save | gzip 导出镜像压缩包到远端路径。
 
         用 pipefail 确保管道中 docker save 失败能够反映到退出码；
@@ -115,7 +120,8 @@ class DockerManager:
         inner = (f"set -o pipefail; docker save {shq(ref)} "
                  f"| gzip -1 > {shq(remote_path)}")
         res = self.ssh.exec_stream(f"bash -c {shq(inner)}",
-                                   on_line=on_line, timeout=7200)
+                                   on_line=on_line, timeout=7200,
+                                   cancelled=cancelled)
         if not res.ok:
             detail = (res.stderr or res.stdout).strip()[:300]
             raise DockerError(f"docker save 失败(退出码 {res.exit_code}): {detail}")
@@ -161,9 +167,11 @@ class DockerManager:
 
     # ------------------------------------------------------------ 容器
     def run(self, command: str,
-            on_line: Optional[Callable[[str], None]] = None) -> CommandResult:
+            on_line: Optional[Callable[[str], None]] = None,
+            cancelled: Optional[Callable[[], bool]] = None) -> CommandResult:
         """执行（用户可编辑过的）docker run 命令。"""
-        return self.ssh.exec_stream(command, on_line=on_line, timeout=600)
+        return self.ssh.exec_stream(command, on_line=on_line, timeout=600,
+                                    cancelled=cancelled)
 
     def list_containers(self, all_states: bool = False) -> List[dict]:
         flag = " -a" if all_states else ""
@@ -184,13 +192,15 @@ class DockerManager:
         return containers
 
     def remove_containers(self, names: List[str],
-                          on_line: Optional[Callable[[str], None]] = None) -> CommandResult:
+                          on_line: Optional[Callable[[str], None]] = None,
+                          cancelled: Optional[Callable[[], bool]] = None) -> CommandResult:
         """docker rm -f：删除容器（运行中的将被强制停止并删除）。"""
         if not names:
             raise DockerError("未指定要删除的容器")
         refs = " ".join(shq(n) for n in names)
         res = self.ssh.exec_stream(f"docker rm -f {refs}",
-                                   on_line=on_line, timeout=600)
+                                   on_line=on_line, timeout=600,
+                                   cancelled=cancelled)
         if not res.ok:
             raise DockerError(
                 f"docker rm 失败: {(res.stderr or res.stdout).strip()[:300]}")
