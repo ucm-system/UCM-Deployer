@@ -15,11 +15,14 @@ def shq(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-_LINE_CONT = re.compile(r"\\\r?\n")
+_LINE_CONT = re.compile(r"\\\s*\r?\n")
 
 
 def flatten_command(cmd: str) -> str:
-    """把多行续行命令压成单行（多余空白折叠）。"""
+    """把多行带续行符的命令压成单行（空白折叠成单空格）。
+
+    续行符兼容行尾「\\ 空白 + 换行」的格式（从日志复制的命令常见）。
+    """
     one = _LINE_CONT.sub(" ", cmd)
     one = re.sub(r"\s+", " ", one)
     return one.strip()

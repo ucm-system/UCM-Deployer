@@ -358,7 +358,8 @@ class PrecheckRunner:
     def run(self, container: str, mount_path: str = "",
             skip_bandwidth: bool = False, timeout: float = 3600,
             config_path: str = "",
-            on_line: Optional[Callable[[str], None]] = None) -> PrecheckResult:
+            on_line: Optional[Callable[[str], None]] = None,
+            cancelled: Optional[Callable[[], bool]] = None) -> PrecheckResult:
         """在容器内运行 ucm-toolkit run precheck。
 
         mount_path 非空时在其下创建临时子目录做带宽测试并自动清理；
@@ -367,6 +368,7 @@ class PrecheckRunner:
         （叠加于出厂默认之上；文件不存在则报错）。
         临时子目录的创建/清理会通过 on_line 播报（[deployer] 前缀），
         便于用户在环境上核对目录是否存在/已被清除。
+        cancelled 回调返回 True 时中断预检命令（批量部署「取消」用）。
         """
         sub_dir = ""
         arg = ""
@@ -397,7 +399,8 @@ class PrecheckRunner:
         cmd = (f"docker exec {shq(container)} ucm-toolkit run precheck"
                f" --no-color {arg}").rstrip()
         try:
-            res = self.ssh.exec_stream(cmd, on_line=on_line, timeout=timeout)
+            res = self.ssh.exec_stream(cmd, on_line=on_line, timeout=timeout,
+                                       cancelled=cancelled)
         finally:
             if sub_dir:
                 # 清理预检临时子目录（尽力而为，失败提示用户手动清理）
@@ -415,6 +418,21 @@ class PrecheckRunner:
             raise PrecheckError(
                 f"precheck 用法错误(退出码 2)：{res.stderr.strip()[:300]}")
         result = parse_precheck_output(res)
+        if not result.ok and not result.items:
+            # 容器内命令本身未执行成功（镜像未安装 ucm-toolkit、容器不存在等），
+            # 未产出任何检查项：此时若继续追加宿主机检查项并重算汇总，
+            # 会把「未安装 toolkit」伪装成全 PASS 的预检结果，严重误导。
+            # 明确报错（状态栏简短提示），原始输出已在日志中。
+            detail = (res.stderr or res.stdout).strip()
+            if "ucm-toolkit" in detail and "not found" in detail.lower():
+                if on_line:
+                    on_line("[deployer] 镜像内未安装 ucm-toolkit，无法执行环境预检。"
+                            "请确认镜像已安装 UCM 相关组件，"
+                            "或回步骤2 重新构建镜像后再创建容器。")
+                raise PrecheckError(
+                    "容器内未安装 ucm-toolkit，无法执行预检（详见日志）")
+            raise PrecheckError(
+                f"precheck 执行失败(退出码 {res.exit_code}): {detail[:150]}")
         if _precheck_needs_facts(result):
             enhance_precheck_result(result, self.collect_precheck_facts(container))
         # 宿主机侧附加检查：SMMU/IOMMU 预期关闭（BIOS 开关；不在容器内执行）。

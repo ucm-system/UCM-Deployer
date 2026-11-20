@@ -363,6 +363,32 @@ def test_run_usage_error_raises(fake_ssh):
         PrecheckRunner(ssh).run("ucm-ctr", mount_path="")
 
 
+def test_run_toolkit_missing_raises(fake_ssh):
+    """容器内未安装 ucm-toolkit（OCI exec 失败）：明确报错，
+    不得把宿主机附加检查伪装成全 PASS 的预检结果。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(
+        r"ucm-toolkit run precheck",
+        stdout=("OCI runtime exec failed: exec failed: unable to start "
+                "container process: exec: \"ucm-toolkit\": executable file "
+                "not found in $PATH: unknown"),
+        exit_code=127)
+    lines = []
+    with pytest.raises(PrecheckError, match="ucm-toolkit"):
+        PrecheckRunner(ssh).run("ucm-ctr", mount_path="", on_line=lines.append)
+    assert any("未安装 ucm-toolkit" in l for l in lines)
+
+
+def test_run_exec_failed_without_items_raises(fake_ssh):
+    """容器不存在等执行失败且无检查项产出：带原始错误摘要明确报错。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"ucm-toolkit run precheck",
+                    stderr="Error response from daemon: No such container: gone",
+                    exit_code=1)
+    with pytest.raises(PrecheckError, match="No such container"):
+        PrecheckRunner(ssh).run("ucm-ctr", mount_path="")
+
+
 def test_run_mkdir_failure_raises(fake_ssh):
     ssh = make_ssh(fake_ssh)
     ssh._client.add(r"test -d /mnt/kv", stdout="")

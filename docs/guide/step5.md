@@ -2,9 +2,11 @@
 
 **纯操作指引页**：页面按操作顺序给出三个模块——UCM 配置文件参考配置、推理服务拉起命令模板与注意事项、连通性验证命令。所有内容可直接复制，在容器内手动完成后按模块3 验证服务是否就绪。
 
+**高亮提示**：模块①②中需要按实际环境修改的片段（存储路径 `/mnt/test`、`UCM_CONFIG_FILE` 路径）以黄底高亮显示，修改对应片段后即可使用。
+
 ## ① UCM 配置文件
 
-页面给出 UCM 配置文件参考默认配置（`UcmPipelineStore` 连接器，`Cache|Posix` 存储管线），`storage_backends`、`posix_capacity_gb`、`posix_io_engine`、`posix_data_trans_concurrency` 等参数请**按实际存储环境修改**：
+页面给出 UCM 配置文件参考默认配置（`UcmPipelineStore` 连接器，`Cache|Posix` 存储管线），`storage_backends`、`posix_capacity_gb`、`posix_io_engine`、`posix_data_trans_concurrency` 等参数请**按实际存储环境修改**（页面中高亮显示）：
 
 ```yaml
 ucm_connectors:
@@ -48,7 +50,7 @@ vllm serve /models/Qwen ... \
 
 ## ③ 验证连通性（服务就绪后，在宿主机另开终端）
 
-端口 `7800` 与模型名 `qwen3.8` 按实际替换：
+在页面顶部的输入框中填写服务**端口**（默认 `7800`）与**模型名**（如 `qwen3.8`，须与 `vllm serve` 的模型一致），下方验证命令**自动生成**，直接复制执行即可：
 
 ```bash
 curl --fail http://127.0.0.1:7800/health

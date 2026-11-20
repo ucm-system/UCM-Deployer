@@ -151,8 +151,13 @@ class SSHClient:
 
     def exec_stream(self, cmd: str,
                     on_line: Optional[Callable[[str], None]] = None,
-                    timeout: Optional[float] = None) -> CommandResult:
-        """执行远端命令，按行流式回调（stderr 合并进 stdout 流）。"""
+                    timeout: Optional[float] = None,
+                    cancelled: Optional[Callable[[], bool]] = None) -> CommandResult:
+        """执行远端命令，按行流式回调（stderr 合并进 stdout 流）。
+
+        cancelled 回调返回 True 时抛 SSHError 中断命令（断开 channel，
+        远端 docker save 等长任务随之终止），供「取消」按钮及时生效。
+        """
         chan = self._open_channel()
         chunks = []
         try:
@@ -171,6 +176,8 @@ class SSHClient:
                         logger.exception("on_line 回调异常")
 
             while True:
+                if cancelled is not None and cancelled():
+                    raise SSHError("操作已取消")
                 progressed = False
                 while chan.recv_ready():
                     buf += chan.recv(65536)

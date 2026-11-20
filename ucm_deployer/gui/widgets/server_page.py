@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.device_detector import DeviceDetector
+from ...core.device_detector import DeviceDetector, check_host_env
 from ...core.models import DeviceInfo, ServerInfo
 from ..state import AppContext
 from .common import ParallelTaskPanel
@@ -183,6 +183,9 @@ class ServerPage(QWidget):
         self.del_btn = QPushButton("🗑 删除")
         self.test_btn = QPushButton("🔌 测试连接")
         self.detect_btn = QPushButton("🔍 探测设备")
+        self.detect_btn.setToolTip(
+            "探测加速设备（NPU/GPU），并预检宿主机环境：\n"
+            "加速器驱动 / 内核版本 / SMMU（与步骤4 预检同一套判定口径）")
         self.add_btn.clicked.connect(self._add)
         self.edit_btn.clicked.connect(self._edit)
         self.del_btn.clicked.connect(self._delete)
@@ -401,6 +404,7 @@ class ServerPage(QWidget):
             # 主机/端口可能已改变：旧设备信息必须失效，避免误导后续步骤
             # （表格设备列随即显示「未探测」，即重新探测的引导）
             self.ctx.devices.pop(info.id, None)
+            self.ctx.env_results.pop(info.id, None)
             self.ctx.registry.touch(info.id, device=DeviceInfo())
             self.refresh()
 
@@ -416,6 +420,7 @@ class ServerPage(QWidget):
             self.ctx.registry.remove(server.id)
             self.ctx.selected = [s for s in self.ctx.selected if s.id != server.id]
             self.ctx.devices.pop(server.id, None)
+            self.ctx.env_results.pop(server.id, None)
             self.ctx.reset_after_servers_changed()
             self.refresh()
             self.selection_changed.emit()
@@ -435,10 +440,11 @@ class ServerPage(QWidget):
         if not self.ensure_selection():
             return
         self._detected = {}
+        self._env_results: Dict[str, list] = {}
 
         def make_fn(server):
             def fn(ssh, tctx):
-                tctx.progress(30, "探测设备...")
+                tctx.progress(10, "探测设备...")
                 dev = DeviceDetector(ssh).detect()
                 tctx.log(f"探测结果: {dev.display}"
                          + (f" / {dev.arch}" if dev.arch else ""))
@@ -446,6 +452,29 @@ class ServerPage(QWidget):
                     raise RuntimeError("未探测到加速设备(NPU/GPU)")
                 tctx.log("步骤2 构建镜像、步骤3 创建容器将按该设备类型自动适配")
                 self._detected[server.id] = dev
+                # 宿主机环境预检（驱动/内核/SMMU）：提前步骤4 部分检查，
+                # 在准备镜像、创建容器之前先确认基础环境可用
+                tctx.progress(55, "检查驱动/内核/SMMU ...")
+                env = check_host_env(ssh)
+                self._env_results[server.id] = env
+                for it in env:
+                    tctx.log(f"[{it.status}] {it.name}  {it.summary}"
+                             + (f"（{it.advice}）"
+                                if it.advice and it.status in ("WARN", "FAIL")
+                                else ""))
+                fails = [it for it in env if it.status == "FAIL"]
+                warns = [it for it in env if it.status == "WARN"]
+                if fails:
+                    tctx.log(
+                        "[deployer] ⚠ 宿主机环境预检未通过"
+                        f"（{len(fails)} 项 FAIL、{len(warns)} 项 WARN），"
+                        "建议先修复后再准备镜像与创建容器")
+                elif warns:
+                    tctx.log(
+                        "[deployer] 宿主机环境预检通过，"
+                        f"但存在 {len(warns)} 项建议关注（见上）")
+                else:
+                    tctx.log("[deployer] 宿主机环境预检通过（驱动/内核/SMMU）")
                 tctx.progress(100, dev.display)
             return fn
 
@@ -454,6 +483,8 @@ class ServerPage(QWidget):
                 QMessageBox.warning(self, "设备探测", "设备探测失败，详见日志")
                 return
             self.ctx.devices.update(self._detected)
+            # 环境预检结果写入共享状态：步骤5 目标服务器表按此展示可用状态
+            self.ctx.env_results.update(self._env_results)
             for sid, dev in self._detected.items():
                 self.ctx.registry.touch(sid, device=dev)
             self.refresh()
@@ -461,6 +492,24 @@ class ServerPage(QWidget):
             # 反馈融入列表：探测到的行设备列短暂高亮
             for sid in self._detected:
                 self._flash_device_cell(sid)
+            # 环境预检 FAIL：明确提示（不强制拦截，详细建议在任务日志）
+            for sid, env in self._env_results.items():
+                fails = [it for it in env if it.status == "FAIL"]
+                if not fails:
+                    continue
+                name = sid
+                for s in self.ctx.registry.list_servers():
+                    if s.id == sid:
+                        name = s.name
+                        break
+                lines = "\n".join(
+                    f"· {it.name}：{it.summary}\n  建议：{it.advice}"
+                    for it in fails if it.advice)
+                QMessageBox.warning(
+                    self, "宿主机环境预检未通过",
+                    f"服务器 {name} 存在不满足项：\n\n{lines}\n\n"
+                    "建议先修复后再准备镜像与创建容器"
+                    "（完整结果与建议见任务日志）。")
 
         self.panel.run_tasks([(s, make_fn(s)) for s in self.ctx.selected],
                              "探测设备", on_finished=on_finished)
