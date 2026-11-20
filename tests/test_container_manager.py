@@ -312,3 +312,67 @@ def test_shared_fs_dir_missing(fake_ssh):
 
 def test_evaluate_empty():
     assert not evaluate_shared_fs([]).ok
+
+
+# ============================================================ 同名容器处理
+def test_ensure_container_removed_noop_when_absent(fake_ssh):
+    """不存在同名容器：直接放行，不执行任何 rm。"""
+    from ucm_deployer.core.container_manager import ensure_container_removed
+    from ucm_deployer.core.docker_manager import DockerManager
+
+    cm, ssh = make_cm(fake_ssh)
+    # docker ps 未注册 -> 127 -> 容器列表为空
+    ensure_container_removed(ssh, DockerManager(ssh), "ucm-vllm",
+                             recreate=False)
+    assert not any(c.executed_command.startswith("docker rm -f")
+                   for c in ssh._client.channels)
+
+
+def test_ensure_container_removed_blocked_without_recreate(fake_ssh):
+    """存在同名容器且未勾选重建：明确报错并给出处理方式，不执行删除。"""
+    from ucm_deployer.core.container_manager import (DockerError,
+                                                     ensure_container_removed)
+    from ucm_deployer.core.docker_manager import DockerManager
+
+    cm, ssh = make_cm(fake_ssh)
+    ssh._client.add(r"^docker ps -a",
+                    stdout="f272\tucm-vllm\timg:v1\tUp\t0\n")
+    with pytest.raises(DockerError, match="同名容器") as ei:
+        ensure_container_removed(ssh, DockerManager(ssh), "ucm-vllm",
+                                 recreate=False)
+    assert "先删除再创建" in str(ei.value)
+    assert not any(c.executed_command.startswith("docker rm -f")
+                   for c in ssh._client.channels)
+
+
+def test_ensure_container_removed_recreates(fake_ssh):
+    """勾选重建：先 docker rm -f 删除同名容器（带日志）再放行。"""
+    from ucm_deployer.core.container_manager import ensure_container_removed
+    from ucm_deployer.core.docker_manager import DockerManager
+
+    cm, ssh = make_cm(fake_ssh)
+    ssh._client.add(r"^docker ps -a",
+                    stdout="f272\tucm-vllm\timg:v1\tUp\t0\n")
+    ssh._client.add(r"^docker rm -f", stdout="ucm-vllm\n")
+    logs = []
+    ensure_container_removed(ssh, DockerManager(ssh), "ucm-vllm",
+                             recreate=True, log=logs.append)
+    executed = [c.executed_command for c in ssh._client.channels]
+    assert any(c == "docker rm -f ucm-vllm" for c in executed)
+    assert any("docker rm -f" in line for line in logs)
+
+
+def test_ensure_container_removed_rm_failure_raises(fake_ssh):
+    """rm 失败且容器仍在：报错提示手动删除（避免静默失败后 run 才暴露冲突）。"""
+    from ucm_deployer.core.container_manager import (DockerError,
+                                                     ensure_container_removed)
+    from ucm_deployer.core.docker_manager import DockerManager
+
+    cm, ssh = make_cm(fake_ssh)
+    ssh._client.add(r"^docker ps -a",
+                    stdout="f272\tucm-vllm\timg:v1\tUp\t0\n")
+    ssh._client.add(r"^docker rm -f", stdout="rm: cannot remove\n",
+                    exit_code=1)
+    with pytest.raises(DockerError, match="删除旧容器"):
+        ensure_container_removed(ssh, DockerManager(ssh), "ucm-vllm",
+                                 recreate=True)

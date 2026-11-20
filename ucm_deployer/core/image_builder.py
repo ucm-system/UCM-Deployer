@@ -339,8 +339,14 @@ def expected_ucm_components(device: Optional[DeviceInfo], base_image: str,
 
 def validate_whl(filename: str, expected_distribution: str,
                  runtime: Optional[ImageRuntimeInfo] = None,
-                 fallback_arch: str = "") -> tuple:
-    """校验单个 wheel 与基础镜像运行时的匹配性，返回 (errors, warnings)。"""
+                 fallback_arch: str = "",
+                 note_unverified: bool = True) -> tuple:
+    """校验单个 wheel 与基础镜像运行时的匹配性，返回 (errors, warnings)。
+
+    note_unverified=False 时不追加「未能确认…跳过校验」类提示
+    （用于 whl 选择即时反馈——该状态由「等待基础镜像运行时检测」
+    文案兜底，完整提示只在「校验匹配」时给出）。
+    """
     errors: List[str] = []
     warnings: List[str] = []
     name = os.path.basename(filename or "")
@@ -358,7 +364,7 @@ def validate_whl(filename: str, expected_distribution: str,
     elif (wheel_abi.startswith("py") and runtime_abi
           and wheel_abi == "py2" and runtime_abi.startswith("cp3")):
         errors.append(f"{name} 是 Python 2 wheel，与基础镜像 {runtime_abi} 不匹配")
-    elif wheel_abi.startswith("cp") and not runtime_abi:
+    elif wheel_abi.startswith("cp") and not runtime_abi and note_unverified:
         warnings.append(f"未能确认基础镜像 Python 版本，跳过 {name} 的 Python 版本校验")
 
     wheel_arch = whl_arch(filename)
@@ -366,7 +372,7 @@ def validate_whl(filename: str, expected_distribution: str,
     if wheel_arch and target_arch and wheel_arch != target_arch:
         errors.append(
             f"{name} 架构不匹配：wheel 为 {wheel_arch}，基础镜像为 {target_arch}")
-    elif wheel_arch and not target_arch:
+    elif wheel_arch and not target_arch and note_unverified:
         warnings.append(f"未能确认基础镜像架构，跳过 {name} 的架构校验")
 
     tag = whl_platform_tag(filename)
@@ -379,7 +385,7 @@ def validate_whl(filename: str, expected_distribution: str,
                 map(int, image_glibc.split("."))):
             errors.append(
                 f"{name} 要求 glibc ≥ {required_glibc}，基础镜像为 {image_glibc}")
-    elif required_glibc and not image_glibc:
+    elif required_glibc and not image_glibc and note_unverified:
         warnings.append(f"未能确认基础镜像 glibc 版本，跳过 {name} 的 glibc 校验")
     if tag and tag != "any" and "linux" not in tag:
         errors.append(f"{name} 不是 Linux wheel（平台标签 {tag}）")

@@ -418,7 +418,7 @@ python -m venv .venv
 <section id="step3">
   <span class="step-badge">步骤 3</span>
   <h2>容器准备</h2>
-  <p>可基于 UCM 镜像创建新容器；如果服务器上已有安装 UCM 的容器，可跳过创建，直接进入步骤 4 选择该容器预检。</p>
+  <p>可基于 UCM 镜像创建新容器；如果服务器上已有安装 UCM 的容器，可跳过创建，直接进入步骤 4 选择该容器预检。创建前自动检测同名容器：已存在且未勾选「同名容器先删除再创建」时明确提示（不会因容器名冲突才失败）；勾选后自动 <code>docker rm -f</code> 删除旧容器（含运行中的）再创建。</p>
   <figure class="figure">
     <img src="screenshots/step3-container.png" alt="容器准备界面" loading="lazy">
     <figcaption>容器准备页：镜像校验、容器参数、挂载配置与命令预览</figcaption>
@@ -542,7 +542,7 @@ docker run -itd \\
 <section id="step5">
   <span class="step-badge">步骤 5</span>
   <h2>服务部署</h2>
-  <p>纯操作指引页，三个模块按操作顺序排布，所有命令与配置均可直接复制使用；在容器内手动完成后按模块3 验证服务连通性。</p>
+  <p>纯操作指引页，三个模块按操作顺序排布，所有命令与配置均可直接复制使用；需要按环境修改的片段以<strong>黄底高亮</strong>显示；模块 3 的验证命令按输入的端口与模型名<strong>自动生成</strong>，可直接复制执行。</p>
   <h3>① UCM 配置文件</h3>
   <p>页面给出 UCM 配置文件参考默认配置（<code>UcmPipelineStore</code> 连接器，<code>Cache|Posix</code> 存储管线），存储路径、容量与并发等参数按实际环境修改：</p>
   <pre><code>ucm_connectors:
@@ -577,7 +577,7 @@ vllm serve /models/Qwen ... \
 </code></pre>
   <p>模板中的模型路径 / 端口等参数按实际填写。</p>
   <h3>③ 验证连通性（服务就绪后，在宿主机另开终端）</h3>
-  <p>端口 <code>7800</code> 与模型名 <code>qwen3.8</code> 按实际替换：</p>
+  <p>在页面输入框填写服务<strong>端口</strong>（默认 <code>7800</code>）与<strong>模型名</strong>（须与 <code>vllm serve</code> 的模型一致），下方验证命令<strong>自动生成</strong>：</p>
   <pre><code>curl --fail http://127.0.0.1:7800/health
 curl --fail http://127.0.0.1:7800/v1/models
 

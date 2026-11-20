@@ -87,6 +87,58 @@ def test_service_page_verify_guide(qapp, tmp_path):
 
 
 # ============================================================ 纯指引页定位
+def test_service_page_highlights_placeholders(qapp, tmp_path):
+    """模块1/2：需按环境修改的片段以高亮富文本展示；复制出的仍是原文。"""
+    from PySide6.QtWidgets import QTextEdit
+
+    from ucm_deployer.gui.widgets.service_page import (
+        START_CMD_HIGHLIGHTS, START_CMD_TEMPLATE, UCM_CONFIG_HIGHLIGHTS,
+        UCM_CONFIG_TEMPLATE, _render_highlighted)
+
+    page = make_page(qapp, tmp_path)
+    assert isinstance(page.cmd_view, QTextEdit)
+    assert isinstance(page.cfg_view, QTextEdit)
+    # 复制内容 = 模板原文（高亮只影响展示样式，不改变文本）
+    assert page.cmd_view.toPlainText() == START_CMD_TEMPLATE.rstrip("\n")
+    assert page.cfg_view.toPlainText() == UCM_CONFIG_TEMPLATE.rstrip("\n")
+    # 富文本包含高亮底色（Qt toHtml 会重排样式，以颜色值为准）
+    assert "#fef3c7" in page.cmd_view.toHtml()
+    assert "#fef3c7" in page.cfg_view.toHtml()
+    for frag in START_CMD_HIGHLIGHTS:
+        assert _render_highlighted(
+            frag, START_CMD_HIGHLIGHTS).count("span") >= 2
+    # 纯函数：模板未含片段时不高亮
+    assert "span" not in _render_highlighted("plain text", ["nope"])
+
+
+def test_service_page_verify_command_generation(qapp, tmp_path):
+    """模块3：按输入的端口/模型名自动生成验证命令；留空保持模板占位值。"""
+    from ucm_deployer.gui.widgets.service_page import (
+        VERIFY_CMD_TEMPLATE, VERIFY_DEFAULT_MODEL, VERIFY_DEFAULT_PORT,
+        build_verify_command)
+
+    # 纯函数：默认值
+    cmd = build_verify_command()
+    assert cmd == VERIFY_CMD_TEMPLATE
+    assert f"127.0.0.1:{VERIFY_DEFAULT_PORT}/health" in cmd
+    assert f'"model": "{VERIFY_DEFAULT_MODEL}"' in cmd
+    # 纯函数：端口与模型名替换（带引号替换不影响其他 7800 场景）
+    cmd = build_verify_command("9000", "glm-9b")
+    assert "9000/health" in cmd
+    assert '"model": "glm-9b"' in cmd
+    assert "7800" not in cmd and "qwen3.8" not in cmd
+    # 纯函数：空白输入回退默认
+    assert "7800/health" in build_verify_command("  ", "")
+    # UI 联动：输入变化实时更新命令文本
+    page = make_page(qapp, tmp_path)
+    assert "7800/health" in page.verify_view.toPlainText()
+    page.verify_port_edit.setText("9000")
+    page.verify_model_edit.setText("glm-9b")
+    verify = page.verify_view.toPlainText()
+    assert "9000/health" in verify
+    assert "9000/v1/models" in verify
+    assert '"model": "glm-9b"' in verify
+    assert "7800" not in verify
 def test_service_page_has_no_exec_widgets(qapp, tmp_path):
     """纯指引页：无部署按钮/容器选择/日志面板等执行组件。"""
     from PySide6.QtWidgets import QComboBox, QPushButton, QTabWidget

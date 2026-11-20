@@ -577,10 +577,13 @@ class ImagePage(QWidget):
         if glibc:
             facts.append(f"glibc ≥ {glibc}")
 
+        # 即时反馈不提示「未能确认…跳过校验」（由「等待基础镜像运行时
+        # 检测」兜底）；完整提示在点「校验匹配」时给出
         errors, warnings = validate_whl(
             path, expected_distribution, runtime=self._image_runtime,
             fallback_arch=(self.ctx.device_of(self.ctx.server).arch
-                           if self.ctx.server else ""))
+                           if self.ctx.server else ""),
+            note_unverified=False)
         if expected_distribution == "uc-manager" and self.ctx.server:
             wheel_platform, wheel_runtime, wheel_variant = \
                 ucm_wheel_components(path)

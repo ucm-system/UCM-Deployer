@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from ...core.container_manager import (ContainerCreateConfig,
                                        ContainerManager, check_shared_fs,
+                                       ensure_container_removed,
                                        evaluate_shared_fs)
 from ...core.docker_manager import DockerError, DockerManager
 from ...core.models import DeviceType, UCMInfo, VolumeMount
@@ -231,7 +233,13 @@ class ContainerPage(QWidget):
         params_row.addWidget(self.shm_edit)
         params_row.addWidget(QLabel("网络"))
         params_row.addWidget(self.net_edit)
+        self.recreate_check = QCheckBox("同名容器先删除再创建")
+        self.recreate_check.setToolTip(
+            "服务器上已存在同名容器时，创建会因容器名冲突失败。\n"
+            "勾选后创建前先 docker rm -f 删除同名旧容器（含运行中的）；\n"
+            "不勾选则检测到同名容器时直接提示，不会执行 docker run。")
         params_row.addStretch(1)
+        params_row.addWidget(self.recreate_check)
         params_row.addWidget(regen_btn)
         params_row.addWidget(check_ctr_btn)
         params_row.addWidget(create_btn)
@@ -624,7 +632,16 @@ class ContainerPage(QWidget):
         cmd = text
 
         def fn(ssh, tctx):
-            tctx.progress(20, "创建容器...")
+            tctx.progress(15, "检查同名容器...")
+            dm = DockerManager(ssh)
+            try:
+                ensure_container_removed(
+                    ssh, dm, self.name_edit.text().strip(),
+                    self.recreate_check.isChecked(),
+                    log=tctx.log, cancelled=tctx.cancelled)
+            except DockerError:
+                raise           # 同名提示/删除失败信息已明确，直接展示
+            tctx.progress(30, "创建容器...")
             cm = ContainerManager(ssh, DockerManager(ssh))
             tctx.log("$ " + cmd.replace("\n", " \\\n"))
             try:

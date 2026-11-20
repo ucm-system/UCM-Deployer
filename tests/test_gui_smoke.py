@@ -774,8 +774,10 @@ def test_image_page_whl_instant_feedback(qapp, tmp_path):
     assert "Python cp39" in page.wrapt_fb.text()
     assert "架构 aarch64" in page.wrapt_fb.text()
     assert "glibc ≥ 2.17" in page.wrapt_fb.text()
-    assert "未能确认基础镜像 Python 版本" in page.wrapt_fb.text()
-    assert "未能确认基础镜像 glibc 版本" in page.wrapt_fb.text()
+    # 即时反馈不提示「未能确认…跳过校验」（完整提示只在「校验匹配」给出），
+    # 未探测基础镜像时由「等待基础镜像运行时检测」文案兜底
+    assert "未能确认" not in page.wrapt_fb.text()
+    assert "等待基础镜像运行时检测" in page.wrapt_fb.text()
 
     ucm = tmp_path / "uc_manager-0.2.1-py3-none-any.whl"
     ucm.write_bytes(b"PK")
@@ -1096,6 +1098,60 @@ def test_check_container_ucm_status_messages(qapp, tmp_path, fake_ssh,
     assert "ucm-vllm" in status
 
 
+def test_container_page_recreate_same_name(qapp, tmp_path, fake_ssh):
+    """步骤3 创建容器：服务器已有同名容器时——
+    未勾选「同名容器先删除再创建」：创建被拒并明确提示处理方式；
+    勾选后：先 docker rm -f 删除旧容器再创建，日志可见 rm 命令。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from ucm_deployer.core.models import DockerImage, ServerInfo, UCMInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.common import fill_image_combo
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    fake_ssh.add_default(r"^docker ps -a",
+                         stdout="f272\tucm-vllm\timg:v1\tUp\t0\n")
+    fake_ssh.add_default(r"^docker rm -f", stdout="ucm-vllm\n")
+    fake_ssh.add_default(r"^docker inspect -f", stdout="running|0\n")
+    fake_ssh.add_default(r"^docker run ", stdout="cid0123\n")
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [s]
+    page = ContainerPage(ctx)
+    page.name_edit.setText("ucm-vllm")
+    page.show()
+    qapp.processEvents()
+    fill_image_combo(page.image_combo,
+                     [DockerImage("img", "v1", "i", "1GB")], current="img:v1")
+    page._ucm_state["img:v1"] = UCMInfo(installed=True, version="0.9.0")
+    page.cmd_edit.setPlainText(
+        "docker run -itd --entrypoint /bin/bash --name ucm-vllm img:v1")
+
+    # 未勾选重建：报错并提示勾选选项；不执行 rm/run
+    page._create()
+    assert _wait_panel(page.panel, qapp), "创建任务超时"
+    qapp.processEvents()
+    status = page.panel.compact_status.text()
+    assert "已存在同名容器" in status
+    executed = [c.executed_command for c in fake_ssh.instances[-1].channels]
+    assert not any(c.startswith("docker rm -f") for c in executed)
+    assert not any(c.startswith("docker run") for c in executed)
+
+    # 勾选重建：先 rm -f 再创建成功
+    page.recreate_check.setChecked(True)
+    page._create()
+    assert _wait_panel(page.panel, qapp), "创建任务超时"
+    qapp.processEvents()
+    assert page.panel.compact_status.text() == "✓ 完成"
+    assert ctx.containers[s.id] == "ucm-vllm"
+    log_text = "\n".join(
+        t.toPlainText() for t in page.panel._logs.values())
+    assert "docker rm -f ucm-vllm" in log_text
+    executed = [c.executed_command for c in fake_ssh.instances[-1].channels]
+    assert "docker rm -f ucm-vllm" in executed
+    assert any(c.startswith("docker run") for c in executed)
 def test_task_panel_export_log(qapp, tmp_path, fake_ssh, monkeypatch):
     """任务记录「⬇ 导出日志」：当前页签日志导出为 UTF-8 文件；空日志被拦截。"""
     from PySide6.QtWidgets import QFileDialog

@@ -19,9 +19,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .container_manager import ContainerCreateConfig, ContainerManager
+from .container_manager import (
+    ContainerCreateConfig,
+    ContainerManager,
+    ensure_container_removed,
+)
 from .device_detector import DeviceDetector
-from .docker_manager import DockerManager
+from .docker_manager import DockerError, DockerManager
 from .models import DeviceInfo, DeviceType, ServerInfo, VolumeMount
 from .precheck import CONFIG_CONTAINER_PATH, PrecheckRunner
 from .shell import shq
@@ -563,27 +567,13 @@ def create_container_from_template(
         command = ContainerManager.generate_run_command(cfg)
         name = template.name
 
-    def _existing_names() -> set:
-        return {c["names"] for c in docker.list_containers(all_states=True)}
-
-    # ---- 同名容器处理：显式检测，杜绝 docker run 阶段才暴露 Conflict
-    if name in _existing_names():
-        if not recreate:
-            raise BatchDeployError(
-                f"目标服务器已存在同名容器 {name}；"
-                "请勾选「同名容器先删除再创建」后重试，或先手动删除旧容器")
-        progress(65, f"删除旧容器 {name} ...")
-        log(f"$ docker rm -f {name}（已选择重建容器）")
-        res = ssh.exec_stream(f"docker rm -f {shq(name)}", timeout=120,
-                              cancelled=cancelled)
-        combined = ((res.stderr or "") + (res.stdout or "")).lower()
-        if not res.ok and "no such container" not in combined:
-            # rm 退出码非零且不是「容器不存在」：再确认一次，仍存在则报错
-            if name in _existing_names():
-                detail = (res.stderr or res.stdout or "").strip()[:200]
-                raise BatchDeployError(
-                    f"删除旧容器 {name} 失败，请手动删除后重试"
-                    + (f"（{detail}）" if detail else ""))
+    # ---- 同名容器处理（与步骤3 共用逻辑）：显式检测，杜绝 docker run
+    # 阶段才暴露 Conflict
+    try:
+        ensure_container_removed(ssh, docker, name, recreate,
+                                 log=log, cancelled=cancelled)
+    except DockerError as exc:
+        raise BatchDeployError(str(exc)) from exc
 
     progress(70, "创建容器...")
     log("$ " + command.replace("\n", " \\\n"))

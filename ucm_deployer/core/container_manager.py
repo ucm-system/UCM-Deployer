@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .docker_manager import DockerError, DockerManager
 from .models import CommandResult, DeviceType, VolumeMount
@@ -306,3 +306,39 @@ class ContainerManager:
         if not res.ok:
             return []
         return [l.strip() for l in res.stdout.splitlines() if l.strip()]
+
+
+def ensure_container_removed(ssh: SSHClient, docker: DockerManager,
+                             name: str, recreate: bool,
+                             log: Optional[Callable[[str], None]] = None,
+                             cancelled: Optional[Callable[[], bool]] = None
+                             ) -> None:
+    """创建容器前处理同名容器（步骤3 与批量部署共用）。
+
+    - 不存在同名容器：直接返回；
+    - 存在且未勾选重建：抛 DockerError 明确提示处理方式；
+    - 存在且勾选重建：docker rm -f 删除并验证（rm 失败且容器仍在时报错，
+      杜绝静默失败后 docker run 才暴露 Conflict）。
+    """
+    log = log or (lambda line: None)
+
+    def _names() -> set:
+        return {c["names"] for c in docker.list_containers(all_states=True)}
+
+    if name not in _names():
+        return
+    if not recreate:
+        raise DockerError(
+            f"已存在同名容器 {name}：请勾选「同名容器先删除再创建」后重试，"
+            "或先手动删除旧容器")
+    log(f"$ docker rm -f {name}（已选择重建容器）")
+    res = ssh.exec_stream(f"docker rm -f {shq(name)}", timeout=120,
+                          cancelled=cancelled)
+    combined = ((res.stderr or "") + (res.stdout or "")).lower()
+    if not res.ok and "no such container" not in combined:
+        # rm 退出码非零且不是「容器不存在」：再确认一次，仍存在则报错
+        if name in _names():
+            detail = (res.stderr or res.stdout or "").strip()[:200]
+            raise DockerError(
+                f"删除旧容器 {name} 失败，请手动删除后重试"
+                + (f"（{detail}）" if detail else ""))
