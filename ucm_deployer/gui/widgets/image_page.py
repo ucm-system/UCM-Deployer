@@ -76,7 +76,7 @@ class ImagePage(QWidget):
 
         # ---------- 1. UCM 镜像检查（自动扫描服务器镜像，只给结论提示；
         #              不再放镜像下拉——选 UCM 镜像创建容器是步骤3 的职责）
-        scan_box = QGroupBox("UCM 镜像检查")
+        scan_box = QGroupBox("1. UCM 镜像检查")
         self.placeholder = QLabel("请先在「1. 服务器管理」点选要登录的服务器")
         self.placeholder.setProperty("role", "hint")
         self.placeholder.setAlignment(Qt.AlignCenter)
@@ -118,6 +118,12 @@ class ImagePage(QWidget):
         self.tar_path_edit = QLineEdit()
         self.tar_path_edit.setPlaceholderText(
             "选择本地镜像 tar / tar.gz / tgz 文件；仅在服务器无法访问仓库时使用")
+        self.tar_remote_edit = QLineEdit()
+        self.tar_remote_edit.setText("/tmp")
+        self.tar_remote_edit.setPlaceholderText("/tmp")
+        self.tar_remote_edit.setToolTip(
+            "镜像包在服务器上的保存目录（绝对路径，默认 /tmp）。\n"
+            "大镜像包建议改到大容量目录（如 /data），避免 /tmp 空间不足。")
         browse_tar_btn = QPushButton("浏览…")
         upload_btn = QPushButton("导入到服务器")
         browse_tar_btn.clicked.connect(
@@ -128,6 +134,7 @@ class ImagePage(QWidget):
         tar_btns.addWidget(upload_btn)
         tar_btns.addStretch(1)
         tar_form.addRow("镜像包", self.tar_path_edit)
+        tar_form.addRow("服务器保存路径", self.tar_remote_edit)
         tar_form.addRow("", tar_btns)
         self.source_stack.addWidget(tar_page)
 
@@ -161,7 +168,7 @@ class ImagePage(QWidget):
             "在目标服务器上直接执行 docker pull；本地无需安装 Docker Desktop")
 
         # ---------- 2a. 基础镜像（构建的输入配置；运行时探测用于安装包匹配提示）
-        base_box = QGroupBox("基础镜像（构建底座）")
+        base_box = QGroupBox("2. 基础镜像（构建底座）")
         self.runtime_label = QLabel("基础镜像运行时：选择镜像后自动检测")
         self.runtime_label.setProperty("role", "hint")
         self.runtime_label.setWordWrap(True)
@@ -178,7 +185,7 @@ class ImagePage(QWidget):
         self._update_pull_command()
 
         # ---------- 2b. 安装包（常驻；仅构建新 UCM 镜像时才需要填写）
-        self.build_box = QGroupBox("安装包（仅构建新 UCM 镜像时填写）")
+        self.build_box = QGroupBox("3. 安装包（仅构建新 UCM 镜像时填写）")
         self.wrapt_whl_edit = QLineEdit()
         self.ucm_whl_edit = QLineEdit()
         self.toolkit_edit = QLineEdit()
@@ -253,7 +260,7 @@ class ImagePage(QWidget):
         form.addRow(self.toolkit_dl_hint)
 
         # ---------- 3. 新镜像名与构建操作（仅「构建新 UCM 镜像」分支显示）
-        name_box = QGroupBox("新镜像名与构建")
+        name_box = QGroupBox("4. 新镜像名与构建")
         self.tag_edit = QLineEdit()
         self.tag_edit.setPlaceholderText("默认自动生成：<基础镜像名>:ucm-<UCM版本号>，可修改")
         self.tag_edit.textChanged.connect(self._on_tag_edited)
@@ -325,9 +332,25 @@ class ImagePage(QWidget):
         if server is None:
             return
         if self._loaded_sid != server.id:
+            self._reset_for_server_switch()
             self._scan_images()
         else:
             self._apply_images()
+
+    def _reset_for_server_switch(self) -> None:
+        """切换服务器：清理上一台的镜像列表/UCM 与运行时缓存、复位控件。
+
+        不清理的话，新服务器扫描失败时界面仍显示上一台的镜像，误导用户。
+        """
+        self._images = []
+        self._loaded_sid = None
+        self._ucm_cache = {}
+        self._runtime_cache = {}
+        self._scan_installed = []
+        self._image_runtime = None
+        fill_image_combo(self.image_combo, [])
+        self.runtime_label.setText("基础镜像运行时：选择镜像后自动检测")
+        self._refresh_whl_feedback()
 
     def _update_platform_label(self) -> None:
         server = self.ctx.server
@@ -554,10 +577,13 @@ class ImagePage(QWidget):
         if glibc:
             facts.append(f"glibc ≥ {glibc}")
 
+        # 即时反馈不提示「未能确认…跳过校验」（由「等待基础镜像运行时
+        # 检测」兜底）；完整提示在点「校验匹配」时给出
         errors, warnings = validate_whl(
             path, expected_distribution, runtime=self._image_runtime,
             fallback_arch=(self.ctx.device_of(self.ctx.server).arch
-                           if self.ctx.server else ""))
+                           if self.ctx.server else ""),
+            note_unverified=False)
         if expected_distribution == "uc-manager" and self.ctx.server:
             wheel_platform, wheel_runtime, wheel_variant = \
                 ucm_wheel_components(path)
@@ -642,14 +668,17 @@ class ImagePage(QWidget):
                         installed.append((ref, ucm))
                         break   # 找到一个即可下结论，停止检查剩余疑似镜像
             self._scan_installed = installed
+            # 扫描正常结束（含发现 UCM 镜像提前停止）即上报 100%，
+            # 避免进度条停留在最后一次过程进度（60%）
+            tctx.progress(100, "扫描完成")
 
         def on_finished(all_ok: bool) -> None:
             if not all_ok:
-                # 扫描失败不清空已知镜像（例如导入/拉取后复扫失败的场景）
-                if self._images:
-                    self._apply_images()
-                else:
-                    fill_image_combo(self.image_combo, [])  # 加载失败占位提示
+                # 扫描失败（如新服务器未装 docker）：清空镜像列表，
+                # 绝不显示上一台服务器的镜像，避免误导
+                self._images = []
+                self._scan_installed = []
+                fill_image_combo(self.image_combo, [])  # 加载失败占位提示
                 self._set_scan_state(
                     "✗ 扫描失败：无法获取服务器镜像（详见任务记录）——"
                     "如需使用 UCM，仍可在下方构建", "#d97706")
@@ -688,11 +717,17 @@ class ImagePage(QWidget):
         if not path or not os.path.isfile(path):
             QMessageBox.warning(self, "参数错误", "请先选择有效的镜像 tar/tar.gz 文件")
             return
+        remote_dir = self.tar_remote_edit.text().strip() or "/tmp"
+        if not remote_dir.startswith("/"):
+            QMessageBox.warning(
+                self, "参数错误",
+                "服务器保存路径必须是绝对路径（以 / 开头），如 /tmp 或 /data")
+            return
 
         def fn(ssh, tctx):
             dm = DockerManager(ssh)
             refs = upload_image_tar(
-                ssh, dm, path,
+                ssh, dm, path, remote_dir=remote_dir,
                 progress=lambda p, m: tctx.progress(p, m),
                 log=tctx.log)
             if not refs:
@@ -707,9 +742,11 @@ class ImagePage(QWidget):
             if all_ok:
                 self._apply_images()
                 self._select_source(0)
-                self._scan_images()
+                # 先弹窗确认再重扫：模态框期间不启动新任务，
+                # 避免扫描完成事件在弹窗内被处理（曾连环弹窗）
                 QMessageBox.information(
                     self, "完成", "镜像已导入服务器，并已切换为“服务器已有镜像”。")
+                self._scan_images()
 
         self.panel.run_tasks([(server, fn)], "上传镜像", on_finished=on_finished)
 
@@ -767,12 +804,13 @@ class ImagePage(QWidget):
                 return
             self._apply_images()
             self._select_source(0)
-            self._scan_images()
             self._pull_command_dirty = False
+            # 先弹窗确认再重扫（与导入/构建一致，避免模态框期间事件重入）
             QMessageBox.information(
                 self, "完成",
                 f"镜像 {ref} 已在目标服务器上拉取完成。\n"
                 "已切换为“服务器已有镜像”，可将其选为构建底座。")
+            self._scan_images()
 
         self.panel.run_tasks(
             [(server, fn)], f"服务器拉取镜像（{server.name}）",
@@ -876,11 +914,13 @@ class ImagePage(QWidget):
             if not all_ok:
                 return
             self._apply_images()
-            self._scan_images()
+            # 先弹窗确认再重扫：模态框期间不启动新任务，
+            # 避免扫描完成事件在弹窗内被处理（曾连环弹窗）
             QMessageBox.information(
                 self, "构建完成",
                 f"镜像构建完成: {tag}\n已记录为本服务器使用的 UCM 镜像，"
                 "可进入步骤3创建容器。")
+            self._scan_images()
 
         self.panel.run_tasks([(server, fn)], f"构建镜像（{server.name}）",
                              on_finished=on_finished)

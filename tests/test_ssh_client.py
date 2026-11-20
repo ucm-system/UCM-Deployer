@@ -41,6 +41,23 @@ def test_exec_combine_stderr(fake_ssh):
     assert "out" in res.stdout and "err" in res.stdout
 
 
+def test_exec_stream_cancelled(fake_ssh):
+    """cancelled 回调返回 True：立即抛 SSHError 中断（修复前取消按钮
+    对 docker save 等长命令无效）。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^sleep", stdout="")
+    with pytest.raises(SSHError, match="取消"):
+        ssh.exec_stream("sleep 5", cancelled=lambda: True)
+
+
+def test_exec_stream_cancelled_false_completes(fake_ssh):
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^echo", stdout="hello\n")
+    res = ssh.exec_stream("echo hello", cancelled=lambda: False)
+    assert res.ok
+    assert "hello" in res.stdout
+
+
 def test_connect_failure_raises_ssherror(fake_ssh):
     fake_ssh.connect_exception = OSError("unreachable")
     ssh = SSHClient(ServerInfo.create(name="s", host="1.2.3.4", port=1))

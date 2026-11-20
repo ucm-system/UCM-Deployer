@@ -6,14 +6,16 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .docker_manager import DockerError, DockerManager
 from .models import CommandResult, DeviceType, VolumeMount
 from .shell import flatten_command, shq
 from .ssh_client import SSHClient
 
-# Ascend 容器候选系统挂载（按宿主机实际存在情况筛选；父目录存在时跳过子路径）
+# Ascend 容器候选系统挂载（按宿主机实际存在情况筛选；父目录存在时跳过子路径）。
+# 注意：不要挂载 /usr/lib64 —— 宿主机动态库覆盖容器内库目录会导致容器
+# 内程序（含 bash）加载失败并立即退出。
 ASCEND_SYSTEM_MOUNT_CANDIDATES: List[str] = [
     "/usr/local/Ascend/driver",
     "/usr/local/Ascend/driver/lib64",
@@ -22,12 +24,15 @@ ASCEND_SYSTEM_MOUNT_CANDIDATES: List[str] = [
     "/usr/local/dcmi",
     "/usr/local/sbin",
     "/usr/local/bin/npu-smi",
-    "/usr/lib64",
+    "/usr/bin/urma_admin",
     "/etc/ascend_install.info",
     "/etc/hccl_rootinfo.json",
     "/etc/hixlep",
     "/root/.cache",
 ]
+
+# 950（A5）机型的 URMA 管理工具：宿主机实际存在时以只读方式挂载
+ASCEND_SYSTEM_MOUNTS_READONLY = {"/usr/bin/urma_admin"}
 
 ASCEND_SYSTEM_MOUNTS: List[Tuple[str, str]] = [
     (path, path) for path in ASCEND_SYSTEM_MOUNT_CANDIDATES
@@ -170,7 +175,8 @@ class ContainerManager:
                 lines.append(f"    --device {shq(node)}")
             system_mounts = cfg.system_mounts or ASCEND_SYSTEM_MOUNTS
             for host, cont in system_mounts:
-                lines.append(f"    -v {shq(host)}:{shq(cont)}")
+                suffix = ":ro" if host in ASCEND_SYSTEM_MOUNTS_READONLY else ""
+                lines.append(f"    -v {shq(host)}:{shq(cont)}{suffix}")
         elif cfg.device_type == DeviceType.NVIDIA:
             # NVIDIA: --runtime nvidia --gpus all + 端口映射 + --ipc=host
             lines.append("    --runtime nvidia")
@@ -231,6 +237,10 @@ class ContainerManager:
         selected: List[Tuple[str, str]] = []
         for host in (line.strip().rstrip("/") for line in res.stdout.splitlines()
                      if line.strip()):
+            # 只接受候选列表内的路径（候选已排除 /usr/lib64 等会破坏
+            # 容器内动态库的挂载）
+            if host not in ASCEND_SYSTEM_MOUNT_CANDIDATES:
+                continue
             nested = any(
                 host == parent or host.startswith(parent + "/")
                 for parent, _ in selected
@@ -267,12 +277,24 @@ class ContainerManager:
                 "创建命令不得在镜像后追加 bash；"
                 "--entrypoint /bin/bash 已保证容器进入 Bash 并保持运行")
 
-    def create(self, command: str,
-               on_line=None) -> CommandResult:
-        """执行（可能被用户编辑过的）docker run 命令。"""
+    def create(self, command: str, on_line=None,
+               cancelled=None) -> CommandResult:
+        """执行（可能被用户编辑过的）docker run 命令。
+
+        退出码非零时抛 DockerError（含 stderr 摘要）——否则容器名冲突等
+        失败会被误判为成功，批量流水线会继续执行后续阶段。
+        支持直接粘贴日志中的命令行：容忍行尾「\\ 空白」续行与「$ 」前缀。
+        """
         self._validate_shell_entrypoint(command)
         flat = flatten_command(command)
-        return self.docker.run(flat, on_line=on_line)
+        if flat.startswith("$ "):
+            flat = flat[2:].strip()      # 日志前缀 "$ docker run ..." -> 去掉
+        res = self.docker.run(flat, on_line=on_line, cancelled=cancelled)
+        if not res.ok:
+            detail = (res.stderr or res.stdout or "").strip()
+            raise DockerError(
+                f"docker run 失败(退出码 {res.exit_code}): {detail[:400]}")
+        return res
 
     # ------------------------------------------------------------ 浏览
     def list_host_dirs(self, path: str = "/") -> List[str]:
@@ -284,3 +306,39 @@ class ContainerManager:
         if not res.ok:
             return []
         return [l.strip() for l in res.stdout.splitlines() if l.strip()]
+
+
+def ensure_container_removed(ssh: SSHClient, docker: DockerManager,
+                             name: str, recreate: bool,
+                             log: Optional[Callable[[str], None]] = None,
+                             cancelled: Optional[Callable[[], bool]] = None
+                             ) -> None:
+    """创建容器前处理同名容器（步骤3 与批量部署共用）。
+
+    - 不存在同名容器：直接返回；
+    - 存在且未勾选重建：抛 DockerError 明确提示处理方式；
+    - 存在且勾选重建：docker rm -f 删除并验证（rm 失败且容器仍在时报错，
+      杜绝静默失败后 docker run 才暴露 Conflict）。
+    """
+    log = log or (lambda line: None)
+
+    def _names() -> set:
+        return {c["names"] for c in docker.list_containers(all_states=True)}
+
+    if name not in _names():
+        return
+    if not recreate:
+        raise DockerError(
+            f"已存在同名容器 {name}：请勾选「同名容器先删除再创建」后重试，"
+            "或先手动删除旧容器")
+    log(f"$ docker rm -f {name}（已选择重建容器）")
+    res = ssh.exec_stream(f"docker rm -f {shq(name)}", timeout=120,
+                          cancelled=cancelled)
+    combined = ((res.stderr or "") + (res.stdout or "")).lower()
+    if not res.ok and "no such container" not in combined:
+        # rm 退出码非零且不是「容器不存在」：再确认一次，仍存在则报错
+        if name in _names():
+            detail = (res.stderr or res.stdout or "").strip()[:200]
+            raise DockerError(
+                f"删除旧容器 {name} 失败，请手动删除后重试"
+                + (f"（{detail}）" if detail else ""))

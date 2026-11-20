@@ -92,15 +92,16 @@ class MainWindow(QMainWindow):
         # 因此导航回退/程序切换不会造成信号重入。
         self.nav_group.idClicked.connect(self._switch)
 
-        prev_btn = QPushButton("← 上一步")
-        next_btn = QPushButton("下一步 →")
-        next_btn.setProperty("accent", True)
-        prev_btn.clicked.connect(self._prev)
-        next_btn.clicked.connect(self._next)
+        self._prev_btn = QPushButton("← 上一步")
+        self._next_btn = QPushButton("下一步 →")
+        self._prev_btn.clicked.connect(self._prev)
+        self._next_btn.clicked.connect(self._next)
         nav_btns = QHBoxLayout()
-        nav_btns.addWidget(prev_btn)
+        nav_btns.addWidget(self._prev_btn)
         nav_btns.addStretch(1)
-        nav_btns.addWidget(next_btn)
+        nav_btns.addWidget(self._next_btn)
+        # 首步无「上一步」、末步无「下一步」
+        self._update_nav_btns()
 
         left = QVBoxLayout()
         left.setSpacing(10)
@@ -278,6 +279,13 @@ class MainWindow(QMainWindow):
         self._active_row = row
         self.pages.setCurrentIndex(row)
         self._update_status()
+        self._update_nav_btns()
+
+    def _update_nav_btns(self) -> None:
+        """首步隐藏「上一步」、末步隐藏「下一步」。"""
+        last = len(_STEPS) - 1
+        self._prev_btn.setVisible(self._active_row > 0)
+        self._next_btn.setVisible(self._active_row < last)
 
     def _prev(self) -> None:
         if self._active_row > 0:

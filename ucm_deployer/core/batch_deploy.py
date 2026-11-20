@@ -15,12 +15,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .container_manager import ContainerCreateConfig, ContainerManager
+from .container_manager import (
+    ContainerCreateConfig,
+    ContainerManager,
+    ensure_container_removed,
+)
 from .device_detector import DeviceDetector
-from .docker_manager import DockerManager
+from .docker_manager import DockerError, DockerManager
 from .models import DeviceInfo, DeviceType, ServerInfo, VolumeMount
 from .precheck import CONFIG_CONTAINER_PATH, PrecheckRunner
 from .shell import shq
@@ -53,12 +58,15 @@ class BatchContainerConfig:
 
     name: str = "ucm-vllm"
     shm_size: str = "512g"
-    network: str = "host"                  # Ascend 使用（--net=host）
+    network: str = "host"                  # Ascend 使用 --net=host
     ports: List[str] = field(default_factory=lambda: ["8000:8000"])  # NVIDIA
     kv_cache_dirs: List[str] = field(default_factory=list)
     model_mount: Optional[VolumeMount] = None
     extra_mounts: List[VolumeMount] = field(default_factory=list)
     extra_args: str = ""
+    # 自定义 docker run 命令（完整命令，所有目标使用同一条，跳过逐台设备
+    # 适配；{image} 占位符执行时替换为实际镜像引用）。空 = 自动生成。
+    custom_command: str = ""
 
     def validate(self) -> None:
         if not self.name or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", self.name):
@@ -78,6 +86,7 @@ class BatchContainerConfig:
                             if self.model_mount is not None else None),
             "extra_mounts": [_mount_to_dict(m) for m in self.extra_mounts],
             "extra_args": self.extra_args,
+            "custom_command": self.custom_command,
         }
 
     @classmethod
@@ -93,6 +102,7 @@ class BatchContainerConfig:
         cfg.extra_mounts = [_parse_mount(m) for m in
                             _as_list(d.get("extra_mounts")) if _parse_mount(m)]
         cfg.extra_args = str(d.get("extra_args") or "")
+        cfg.custom_command = str(d.get("custom_command") or "")
         return cfg
 
     def to_container_create_config(
@@ -195,6 +205,7 @@ class BatchTargetReport:
     container: str = ""
     precheck_summary: str = ""
     precheck_verdict: str = ""             # passed / completed / failed / ""
+    error: str = ""                        # 执行失败原因（成功为空）
 
     def describe(self) -> str:
         parts: List[str] = []
@@ -207,6 +218,9 @@ class BatchTargetReport:
                           "failed": "预检未通过"}.get(self.precheck_verdict,
                                                       self.precheck_verdict)
             parts.append(verdict_zh)
+        if self.error:
+            # 状态栏/汇总弹窗保持简短；完整失败原因见该服务器日志页签
+            parts.append("执行失败（详见该服务器日志页签）")
         return "；".join(parts) if parts else "无操作"
 
 
@@ -371,7 +385,8 @@ def export_image_tar(ssh: SSHClient, docker: DockerManager, image_ref: str,
         raise BatchDeployError("已取消")
     log(f"$ docker save {image_ref} | gzip -1 > {remote_path}")
     try:
-        docker.save_image(image_ref, remote_path, on_line=lambda line: log(line))
+        docker.save_image(image_ref, remote_path, on_line=lambda line: log(line),
+                          cancelled=cancelled)
     except Exception as exc:
         _try_rm(ssh, remote_path)
         raise BatchDeployError(f"导出镜像失败: {exc}") from exc
@@ -481,16 +496,29 @@ def detect_target_device(ssh: SSHClient,
     return dev
 
 
+def _container_state(ssh: SSHClient, name: str) -> Tuple[str, str]:
+    """docker inspect 读取容器状态与退出码；inspect 不可用时返回 ("", "")。"""
+    res = ssh.exec(
+        f"docker inspect -f '{{{{.State.Status}}}}|{{{{.State.ExitCode}}}}'"
+        f" {shq(name)}", timeout=15)
+    if not res.ok:
+        return "", ""
+    status, _, code = res.stdout.strip().partition("|")
+    return status.strip(), code.strip()
+
+
 def create_container_from_template(
     ssh: SSHClient, docker: DockerManager, template: BatchContainerConfig,
     image_ref: str, progress: Optional[ProgressFn] = None,
     log: Optional[LogFn] = None,
     recreate: bool = False,
+    cancelled: Optional[CancelledFn] = None,
 ) -> Tuple[str, str]:
     """在目标服务器上按模板创建容器。
 
     流程：校验镜像 UCM -> 探测设备 -> （Ascend）探测实际设备节点与系统挂载
-    -> 生成 docker run -> 执行。返回 (容器名, 命令)。
+    -> 同名容器处理（未勾重建时明确报错；勾选时删除并验证）-> docker run。
+    返回 (容器名, 命令)。
     """
     progress = progress or (lambda pct, msg: None)
     log = log or (lambda line: None)
@@ -502,51 +530,85 @@ def create_container_from_template(
         raise BatchDeployError(
             f"镜像 {image_ref} 未安装 UCM，无法创建容器（请回步骤2构建/选择含 UCM 的镜像）")
 
-    progress(25, "探测设备...")
-    dev = detect_target_device(ssh, log=log)
+    # ---- 自定义命令模式：所有目标使用同一条命令，跳过逐台设备适配
+    custom = template.custom_command.strip()
+    if custom:
+        if not custom.replace("\\\n", " ").startswith("docker run"):
+            raise BatchDeployError(
+                "自定义命令必须以 docker run 开头（多行命令以 \\ 续行）")
+        command = custom.replace("{image}", image_ref)
+        m = re.search(r"--name[= ]([^\s\\]+)", command)
+        name = m.group(1).strip("'\"") if m else template.name
+        progress(30, "使用自定义 docker run 命令")
+        log("使用自定义命令（跳过逐台设备适配；{image} 已替换为 "
+            f"{image_ref}）")
+    else:
+        progress(25, "探测设备...")
+        dev = detect_target_device(ssh, log=log)
 
-    device_nodes: List[str] = []
-    system_mounts: List[Tuple[str, str]] = []
-    privileged = False
-    if dev.device_type == DeviceType.ASCEND:
-        progress(45, "探测 Ascend 设备节点与系统挂载...")
-        manager = ContainerManager(ssh)
-        device_nodes = manager.list_ascend_devices()
-        system_mounts = manager.list_ascend_mounts()
-        privileged = any(node in ("/dev/ummu", "/dev/uburma")
-                         for node in device_nodes)
-        log(f"Ascend 设备节点: {', '.join(device_nodes)}")
-        log(f"Ascend 系统挂载: {len(system_mounts)} 项"
-            + ("（含 /dev/ummu|uburma，将使用 --privileged）" if privileged else ""))
+        device_nodes: List[str] = []
+        system_mounts: List[Tuple[str, str]] = []
+        privileged = False
+        if dev.device_type == DeviceType.ASCEND:
+            progress(45, "探测 Ascend 设备节点与系统挂载...")
+            manager = ContainerManager(ssh)
+            device_nodes = manager.list_ascend_devices()
+            system_mounts = manager.list_ascend_mounts()
+            privileged = any(node in ("/dev/ummu", "/dev/uburma")
+                             for node in device_nodes)
+            log(f"Ascend 设备节点: {', '.join(device_nodes)}")
+            log(f"Ascend 系统挂载: {len(system_mounts)} 项"
+                + ("（含 /dev/ummu|uburma，将使用 --privileged）" if privileged else ""))
 
-    cfg = template.to_container_create_config(
-        image_ref, dev.device_type, dev.count, device_nodes,
-        system_mounts, privileged)
-    cfg.validate()
-    command = ContainerManager.generate_run_command(cfg)
+        cfg = template.to_container_create_config(
+            image_ref, dev.device_type, dev.count, device_nodes,
+            system_mounts, privileged)
+        cfg.validate()
+        command = ContainerManager.generate_run_command(cfg)
+        name = template.name
 
-    if recreate:
-        progress(65, f"删除旧容器 {cfg.name}（如存在）...")
-        log(f"$ docker rm -f {cfg.name}（已选择重建容器）")
-        try:
-            ssh.exec_stream(f"docker rm -f {shq(cfg.name)}", timeout=120)
-        except Exception:  # 容器不存在时 rm 返回非零，忽略
-            pass
+    # ---- 同名容器处理（与步骤3 共用逻辑）：显式检测，杜绝 docker run
+    # 阶段才暴露 Conflict
+    try:
+        ensure_container_removed(ssh, docker, name, recreate,
+                                 log=log, cancelled=cancelled)
+    except DockerError as exc:
+        raise BatchDeployError(str(exc)) from exc
 
     progress(70, "创建容器...")
     log("$ " + command.replace("\n", " \\\n"))
     manager = ContainerManager(ssh, DockerManager(ssh))
     try:
-        manager.create(command, on_line=lambda l: log(l))
+        manager.create(command, on_line=lambda l: log(l), cancelled=cancelled)
     except Exception as exc:
         raise BatchDeployError(f"创建容器失败: {exc}") from exc
-    progress(100, f"容器 {cfg.name} 已创建")
-    return cfg.name, command
+
+    # ---- 创建后确认容器处于运行状态（docker exec/预检的前置条件；
+    # 容器启动即退出时（如入口异常）预先给出明确诊断，而不是预检阶段
+    # 才报 "Container ... is not running"）
+    progress(85, "确认容器运行状态...")
+    status, exit_code = "", ""
+    for _ in range(10):
+        status, exit_code = _container_state(ssh, name)
+        if not status or status == "running" or status in ("exited", "dead"):
+            break
+        time.sleep(0.5)
+    if status and status != "running":
+        raise BatchDeployError(
+            f"容器 {name} 创建后未保持运行（状态 {status}"
+            + (f"，退出码 {exit_code}" if exit_code else "")
+            + "）；请在服务器上执行 docker logs " + name + " 查看退出原因，"
+            "处理后重新部署")
+    if status == "running":
+        log(f"容器运行状态确认: running（ID 已返回）")
+    progress(100, f"容器 {name} 已创建")
+    return name, command
 
 
 def run_precheck_on_target(
     ssh: SSHClient, precheck: BatchPrecheckConfig, container: str,
     progress: Optional[ProgressFn] = None, log: Optional[LogFn] = None,
+    cancelled: Optional[CancelledFn] = None,
 ):
     """在目标容器内执行环境预检（可选写入自定义配置）。返回 PrecheckResult。"""
     progress = progress or (lambda pct, msg: None)
@@ -570,7 +632,8 @@ def run_precheck_on_target(
             mount_path=(precheck.mount_path if precheck.bandwidth_check else ""),
             skip_bandwidth=not precheck.bandwidth_check,
             config_path=CONFIG_CONTAINER_PATH if use_config else "",
-            on_line=lambda line: log(line))
+            on_line=lambda line: log(line),
+            cancelled=cancelled)
     except Exception as exc:
         raise BatchDeployError(f"预检执行失败: {exc}") from exc
 

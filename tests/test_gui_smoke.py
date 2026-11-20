@@ -96,6 +96,17 @@ def test_nav_is_flat_buttons(qapp):
     assert win._nav_buttons[0].isChecked()
     win.goto_step(0)
     assert win._nav_buttons[0].isChecked()
+    # 首步无「上一步」、末步无「下一步」；上/下一步按钮均不标蓝（无 accent）
+    assert win._prev_btn.isHidden()
+    assert not win._prev_btn.property("accent")
+    assert not win._next_btn.property("accent")
+    win.goto_step(3)
+    qapp.processEvents()
+    assert not win._prev_btn.isHidden() and not win._next_btn.isHidden()
+    win.goto_step(5)
+    qapp.processEvents()
+    assert not win._prev_btn.isHidden()
+    assert win._next_btn.isHidden()
     win.close()
 
 
@@ -488,6 +499,105 @@ def test_image_page_refresh_populates_combo(qapp, tmp_path, fake_ssh):
     assert "构建" in page.scan_state_label.text()
 
 
+def test_scan_images_progress_completes(qapp, tmp_path, fake_ssh):
+    """扫描发现 UCM 镜像（提前停止检查剩余疑似镜像）后，任务进度应到 100%。"""
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.image_page import ImagePage
+
+    fake_ssh.add_default(r"^docker info", stdout="ok\n")
+    fake_ssh.add_default(
+        r"images --format",
+        stdout=("ucm-engine\tv0.9\tid1\t5GB\t2026-09-01\n"
+                "ucm-engine\tv0.8\tid2\t5GB\t2026-08-01\n"))
+    fake_ssh.add_default(r"grep -iE", stdout="uc-manager==0.9.0\n")
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    server = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [server]
+    page = ImagePage(ctx)
+    page.show()   # compact 进度条仅在实际显示时更新（与真实使用一致）
+    qapp.processEvents()
+    page._scan_images()
+    assert _wait_panel(page.panel, qapp), "扫描任务超时"
+    qapp.processEvents()
+
+    assert page.panel.compact_bar.value() == 100, \
+        f"扫描完成（发现 UCM 镜像提前停止）后进度应为 100%: {page.panel.compact_bar.value()}"
+    assert page.panel.compact_bar.format() == "100%"
+    assert "发现已有 UCM 镜像" in page.scan_state_label.text()
+
+
+def test_server_switch_clears_stale_state(qapp, tmp_path, fake_ssh):
+    """切换服务器：上一台的镜像/命令/设备信息不得残留。
+
+    场景：A（docker 可用，有 UCM 镜像）完成步骤2/3 后，
+    切到 B（docker 命令全部失败）再进步骤2/3，页面应清空并提示失败，
+    而不是继续显示 A 的镜像。
+    """
+    import time as _t
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.common import combo_ref
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+    from ucm_deployer.gui.widgets.image_page import ImagePage
+
+    def _wait_quick(page):
+        deadline = _t.time() + 15
+        while page._quick_tasks and _t.time() < deadline:
+            qapp.processEvents()
+            _t.sleep(0.05)
+        qapp.processEvents()
+
+    # 服务器 A：docker 可用，镜像列表含已装 UCM 的镜像
+    fake_ssh.add_default(r"^docker info", stdout="ok\n")
+    fake_ssh.add_default(
+        r"images --format", stdout="ucm-engine\tv0.9\tid1\t5GB\t2026-09-01\n")
+    fake_ssh.add_default(r"grep -iE", stdout="uc-manager==0.9.0\n")
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    a = ServerInfo.create(name="A", host="127.0.0.1")
+    b = ServerInfo.create(name="B", host="127.0.0.2")
+    ctx.selected = [a]
+    img_page = ImagePage(ctx)
+    ctr_page = ContainerPage(ctx)
+    img_page.show()
+    ctr_page.show()
+    qapp.processEvents()
+
+    img_page.on_enter()
+    assert _wait_panel(img_page.panel, qapp), "A 扫描任务超时"
+    ctr_page.on_enter()
+    _wait_quick(ctr_page)
+    # 基线：A 上镜像下拉已填充
+    assert combo_ref(img_page.image_combo) == "ucm-engine:v0.9"
+
+    # 切到 B：所有远端命令失败（模拟 docker 未安装）
+    ctx.selected = [b]
+    fake_ssh.add_default(r"", exit_code=1)
+    img_page.on_enter()
+    assert _wait_panel(img_page.panel, qapp), "B 扫描任务超时"
+    ctr_page.on_enter()
+    _wait_quick(ctr_page)
+    qapp.processEvents()
+
+    # 步骤2：不再显示 A 的镜像；状态行提示扫描失败
+    assert combo_ref(img_page.image_combo) == "", \
+        "切换服务器后不得残留上一台的镜像列表"
+    assert "扫描失败" in img_page.scan_state_label.text()
+    # 步骤3：镜像下拉清空、UCM 状态提示失败、旧命令与设备探测结果清空
+    assert combo_ref(ctr_page.image_combo) == "", \
+        "切换服务器后不得残留上一台的镜像列表"
+    assert "获取失败" in ctr_page.ucm_check_label.text()
+    assert ctr_page.cmd_edit.toPlainText() == "", \
+        "切换服务器后应清空上一台的 docker run 命令"
+    assert not ctr_page._ascend_devices, \
+        "切换服务器后不得残留上一台的设备节点"
+
+
 def test_image_page_apply_images_triggers_runtime_probe(qapp, tmp_path, monkeypatch):
     """fill_image_combo 会阻断信号，刷新后必须手动触发运行时探测。"""
     from ucm_deployer.core.models import DockerImage, ServerInfo
@@ -675,8 +785,10 @@ def test_image_page_whl_instant_feedback(qapp, tmp_path):
     assert "Python cp39" in page.wrapt_fb.text()
     assert "架构 aarch64" in page.wrapt_fb.text()
     assert "glibc ≥ 2.17" in page.wrapt_fb.text()
-    assert "未能确认基础镜像 Python 版本" in page.wrapt_fb.text()
-    assert "未能确认基础镜像 glibc 版本" in page.wrapt_fb.text()
+    # 即时反馈不提示「未能确认…跳过校验」（完整提示只在「校验匹配」给出），
+    # 未探测基础镜像时由「等待基础镜像运行时检测」文案兜底
+    assert "未能确认" not in page.wrapt_fb.text()
+    assert "等待基础镜像运行时检测" in page.wrapt_fb.text()
 
     ucm = tmp_path / "uc_manager-0.2.1-py3-none-any.whl"
     ucm.write_bytes(b"PK")
@@ -785,7 +897,7 @@ def test_container_page_command_gen(qapp, tmp_path):
 
 
 def test_container_page_kv_and_mounts(qapp, tmp_path):
-    """统一挂载表：KV Cache（同路径锁定）+ 模型（预置行）+ 自定义，一套按钮。"""
+    """统一挂载表默认为空：KV Cache（同路径锁定）+ 模型 + 自定义，一套按钮。"""
     from PySide6.QtCore import Qt
 
     from ucm_deployer.core.models import DeviceInfo, DeviceType, DockerImage, ServerInfo
@@ -808,9 +920,8 @@ def test_container_page_kv_and_mounts(qapp, tmp_path):
     fill_image_combo(page.image_combo, [DockerImage("img", "t1", "i", "1GB")],
                      current="img:t1")
 
-    # 模型行默认预置（宿主机路径为空 = 不挂载），共 1 行
-    assert page.mount_table.rowCount() == 1
-    assert page.mount_table.item(0, 0).text() == "模型"
+    # 挂载表默认为空（不挂载任何目录）
+    assert page.mount_table.rowCount() == 0
 
     # KV Cache：容器内路径自动同路径锁定
     page.mount_type.setCurrentIndex(0)
@@ -827,11 +938,11 @@ def test_container_page_kv_and_mounts(qapp, tmp_path):
         assert not (page.mount_table.item(r, 2).flags() & Qt.ItemIsEditable), \
             "KV 行容器内路径应锁定不可编辑"
 
-    # 模型：编辑预置行
-    model_row = next(r for r in range(page.mount_table.rowCount())
-                     if page.mount_table.item(r, 0).text() == "模型")
-    page.mount_table.item(model_row, 1).setText("/data/models/Qwen3")
-    page.mount_table.item(model_row, 2).setText("/models")
+    # 模型：通过「➕ 添加」添加一行
+    page.mount_type.setCurrentIndex(1)
+    page.mount_host.edit.setText("/data/models/Qwen3")
+    page.mount_container.setText("/models")
+    page._mount_add()
 
     # 自定义挂载
     page.mount_type.setCurrentIndex(2)
@@ -839,11 +950,14 @@ def test_container_page_kv_and_mounts(qapp, tmp_path):
     page.mount_container.setText("/logs")
     page._mount_add()
 
-    # 模型行重复添加被拦截
+    # 模型行重复添加被拦截（仍只有一行模型）
     page.mount_type.setCurrentIndex(1)
     page.mount_host.edit.setText("/data/other")
     page._mount_add()
     qapp.processEvents()
+    model_rows = [r for r in range(page.mount_table.rowCount())
+                  if page.mount_table.item(r, 0).text() == "模型"]
+    assert len(model_rows) == 1, "模型挂载仅允许一行"
 
     page._regen()
     cmd = page.command_text()
@@ -911,11 +1025,11 @@ def test_container_page_mount_check_selected(qapp, tmp_path, fake_ssh, monkeypat
     page._kv_check()
     assert any("选中" in b for b in boxes), boxes
 
-    # 选中两个 KV 行但位于不同文件系统 → 失败
+    # 选中两个 KV 行但位于不同文件系统 → 失败（行0=KV1, 行1=KV2, 行2=自定义）
     sel = page.mount_table.selectionModel()
-    sel.select(page.mount_table.model().index(1, 0),
+    sel.select(page.mount_table.model().index(0, 0),
                QItemSelectionModel.Select | QItemSelectionModel.Rows)
-    sel.select(page.mount_table.model().index(2, 0),
+    sel.select(page.mount_table.model().index(1, 0),
                QItemSelectionModel.Select | QItemSelectionModel.Rows)
     page._kv_check()
     wait_quick()
@@ -923,14 +1037,76 @@ def test_container_page_mount_check_selected(qapp, tmp_path, fake_ssh, monkeypat
 
     # 选中 KV1 + 自定义行：KV 单行不触发同源判断；自定义行只报文件系统信息
     boxes.clear()
-    sel.select(page.mount_table.model().index(2, 0),
+    sel.select(page.mount_table.model().index(1, 0),
                QItemSelectionModel.Deselect | QItemSelectionModel.Rows)
-    sel.select(page.mount_table.model().index(3, 0),
+    sel.select(page.mount_table.model().index(2, 0),
                QItemSelectionModel.Select | QItemSelectionModel.Rows)
     page._kv_check()
     wait_quick()
     assert any("位于 /dev/sdc1" in b for b in boxes), boxes
     assert not any("不在同一文件系统" in b for b in boxes), boxes
+
+
+def test_check_container_ucm_status_messages(qapp, tmp_path, fake_ssh,
+                                             monkeypatch):
+    """检查容器 UCM：状态栏简短且指明容器；任务标题带容器名；
+    创建失败后检查同名旧容器须弹窗确认，澄清说明进日志而非状态栏。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    fake_ssh.add_default(r"docker inspect", stdout="true\n")
+    fake_ssh.add_default(r"grep -iE", stdout="uc-manager==0.9.0\n")
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [s]
+    page = ContainerPage(ctx)
+    page.name_edit.setText("ucm-vllm")
+    page.show()   # compact 状态栏仅在实际显示时更新（与真实使用一致）
+    qapp.processEvents()
+
+    # 容器存在且已装 UCM：状态栏简短显示结果并指明容器（不再笼统「完成」）
+    page._check_container_ucm()
+    assert _wait_panel(page.panel, qapp), "检查容器 UCM 超时"
+    qapp.processEvents()
+    status = page.panel.compact_status.text()
+    assert "已安装 UCM 0.9.0" in status
+    assert "ucm-vllm" in status
+    assert "同名容器" not in status, "状态栏应保持简短，澄清说明只进日志"
+    assert page.panel.title_label.text() == "检查容器 UCM（ucm-vllm）"
+    assert ctx.containers[s.id] == "ucm-vllm"
+
+    # 创建失败后再检查同名容器：先弹窗确认检查对象；日志写明澄清说明
+    page._create_failed[s.id] = "ucm-vllm"
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: (asked.append(a[2] if len(a) > 2 else ""),
+                                      QMessageBox.StandardButton.Yes)[1]))
+    fake_ssh.add_default(r"docker inspect", stdout="true\n")
+    fake_ssh.add_default(r"grep -iE", stdout="uc-manager==0.9.0\n")
+    page._check_container_ucm()
+    assert _wait_panel(page.panel, qapp), "检查容器 UCM 超时"
+    qapp.processEvents()
+    assert asked and "同名旧容器" in asked[0], "应先弹窗确认检查对象"
+    assert "已安装 UCM 0.9.0" in page.panel.compact_status.text()
+    log_text = page.panel._logs[page.panel._threads[0]].toPlainText()
+    assert "同名容器" in log_text and "本次创建未成功" in log_text
+
+    # 容器内未装 UCM：任务失败，错误信息指明容器与原因
+    page._create_failed[s.id] = ""
+    fake_ssh.add_default(r"docker inspect", stdout="true\n")
+    fake_ssh.add_default(r"grep -iE", stdout="")
+    page._check_container_ucm()
+    assert _wait_panel(page.panel, qapp), "检查容器 UCM 超时"
+    qapp.processEvents()
+    status = page.panel.compact_status.text()
+    assert "未检测到 UCM" in status
+    assert "ucm-vllm" in status
 
 
 def test_task_panel_export_log(qapp, tmp_path, fake_ssh, monkeypatch):
@@ -970,6 +1146,35 @@ def test_task_panel_export_log(qapp, tmp_path, fake_ssh, monkeypatch):
     empty = ParallelTaskPanel()
     empty.export_btn.click()
     assert not target.exists() or "hello-export-line" in content
+
+
+def test_run_tasks_callback_not_reentrant(qapp, fake_ssh):
+    """on_finished 未返回期间 finished_all 再次发射时，旧回调不得重入。
+
+    修复前：on_finished 里弹模态框（期间新任务完成并 emit）或启动新任务，
+    handler 因 finally 未执行仍在连接列表中，会被二次触发，
+    导致「构建完成」等提示连环弹出。
+    """
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.gui.widgets.common import ParallelTaskPanel
+
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    panel = ParallelTaskPanel()
+    calls = []
+
+    def fn(ssh, tctx):
+        tctx.progress(100, "done")
+
+    def on_finished(all_ok):
+        calls.append(all_ok)
+        if len(calls) == 1:
+            # 模拟回调尚未返回时（如模态框期间）新一轮完成信号的发射
+            panel.finished_all.emit(True)
+
+    panel.run_tasks([(s, fn)], "重入保护", on_finished=on_finished)
+    assert _wait_panel(panel, qapp), "任务超时"
+    qapp.processEvents()
+    assert calls == [True]
 
 
 # ============================================================ 步骤4：环境预检

@@ -389,3 +389,34 @@ def test_upload_image_tar(fake_ssh, tmp_path):
     assert refs == ["vllm/vllm-openai:latest"]
     puts = [p for s in ssh._client.sftp_sessions for p in s.puts]
     assert puts[-1][1] == "/tmp/vllm-image.tar.gz"
+
+
+def test_upload_image_tar_custom_remote_dir(fake_ssh, tmp_path):
+    """镜像包保存路径可配置：默认 /tmp，大包可指定大容量目录。"""
+    from ucm_deployer.core.docker_manager import DockerManager
+
+    ssh = make_ssh(fake_ssh)
+    tar = tmp_path / "vllm-image.tar.gz"
+    tar.write_bytes(b"tar-bytes")
+    ssh._client.add(r"^docker load", stdout="Loaded image: vllm/vllm-openai:latest\n")
+    logs = []
+    refs = upload_image_tar(ssh, DockerManager(ssh), str(tar),
+                            log=logs.append, remote_dir="/data/tars")
+    assert refs == ["vllm/vllm-openai:latest"]
+    puts = [p for s in ssh._client.sftp_sessions for p in s.puts]
+    assert puts[-1][1] == "/data/tars/vllm-image.tar.gz"
+    assert any("/data/tars/vllm-image.tar.gz" in l for l in logs)
+
+
+def test_upload_image_tar_relative_remote_dir_rejected(fake_ssh, tmp_path):
+    """保存路径必须是绝对路径（相对路径直接报错，不上传）。"""
+    from ucm_deployer.core.docker_manager import DockerManager
+    from ucm_deployer.core.image_builder import ImageBuildError
+
+    ssh = make_ssh(fake_ssh)
+    tar = tmp_path / "vllm-image.tar.gz"
+    tar.write_bytes(b"tar-bytes")
+    with pytest.raises(ImageBuildError):
+        upload_image_tar(ssh, DockerManager(ssh), str(tar),
+                         remote_dir="data/tars")
+    assert not ssh._client.sftp_sessions

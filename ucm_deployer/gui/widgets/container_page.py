@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 from ...core.container_manager import (ContainerCreateConfig,
                                        ContainerManager, check_shared_fs,
                                        evaluate_shared_fs)
-from ...core.docker_manager import DockerManager
+from ...core.docker_manager import DockerError, DockerManager
 from ...core.models import DeviceType, UCMInfo, VolumeMount
 from ...core.ssh_client import SSHClient
 from ..state import AppContext
@@ -80,14 +80,16 @@ class ContainerPage(QWidget):
         super().__init__(parent)
         self.ctx = ctx
         self._images = []
+        self._loaded_sid: Optional[str] = None      # 已加载镜像列表的服务器
         self._ucm_state: Dict[str, UCMInfo] = {}   # 镜像 ref -> UCM 校验结果
         self._quick_tasks = []                      # 运行中的 QuickTask 引用
+        self._create_failed: Dict[str, str] = {}    # server_id -> 创建失败的容器名
         self._ascend_devices: Optional[List[str]] = None
         self._ascend_mounts: Optional[List[tuple]] = None
         self._ascend_devices_loading = False
 
-        # ---------- 1. UCM 镜像与容器参数
-        top_box = QGroupBox("1. UCM 镜像与容器参数")
+        # ---------- 1. UCM 镜像选择
+        top_box = QGroupBox("1. UCM 镜像选择")
         self.image_combo = QComboBox()
         setup_image_combo(self.image_combo)
         self.image_combo.setMinimumWidth(420)
@@ -111,6 +113,7 @@ class ContainerPage(QWidget):
         self.ascend_device_label.setVisible(False)   # 仅 Ascend 服务器显示
 
         self.name_edit = QLineEdit("ucm-vllm")
+        self.name_edit.setFixedWidth(180)
         self.name_edit.setToolTip("docker 容器名（--name）；步骤4 按此名找到容器进行预检")
         self.shm_edit = QLineEdit("512g")
         self.shm_edit.setFixedWidth(90)
@@ -127,21 +130,12 @@ class ContainerPage(QWidget):
         img_row.addWidget(refresh_img_btn)
         img_form = QFormLayout()
         img_form.addRow("UCM 镜像", img_row)
-        params_row = QHBoxLayout()
-        params_row.addWidget(QLabel("容器名"))
-        params_row.addWidget(self.name_edit)
-        params_row.addWidget(QLabel("共享内存"))
-        params_row.addWidget(self.shm_edit)
-        params_row.addWidget(QLabel("网络"))
-        params_row.addWidget(self.net_edit)
-        params_row.addStretch(1)
         top_layout = QVBoxLayout(top_box)
         top_layout.setSpacing(4)
         top_layout.addLayout(img_form)
         top_layout.addWidget(self.ucm_check_label)
         top_layout.addWidget(self.reuse_hint)
         top_layout.addWidget(self.ascend_device_label)
-        top_layout.addLayout(params_row)
 
         # ---------- 2. 挂载（统一表：KV Cache / 模型 / 自定义，一套按钮）
         mount_box = QGroupBox("2. 挂载（KV Cache / 模型 / 自定义）")
@@ -170,8 +164,7 @@ class ContainerPage(QWidget):
         self.mount_table.setToolTip(
             "所有挂载类型共用本表，操作统一：上方输入后「➕ 添加」，选中行「🗑 移除」。\n"
             "KV Cache 行容器内路径自动与宿主机相同（vLLM 按相同路径读取）。\n"
-            "「模型」行默认预置，可直接编辑；删除该行即不挂载模型。")
-        self._add_mount_row("模型", "", "/models", True)   # 预置模型行（宿主机路径为空=不挂载）
+            "默认表为空（即不挂载任何目录）；需要挂载模型时选择类型后添加。")
 
         mount_del_btn = QPushButton("🗑 移除选中")
         mount_check_btn = QPushButton("🔍 校验选中挂载")
@@ -201,12 +194,15 @@ class ContainerPage(QWidget):
         mount_btns.addStretch(1)
         mount_layout.addLayout(mount_btns)
 
-        # ---------- 3. docker run 命令（按钮在上，编辑框占余下空间）
-        cmd_box = QGroupBox("3. docker run 命令（自动生成，可编辑后执行）")
+        # ---------- 3. 容器配置与创建
+        cmd_box = QGroupBox("3. 容器配置与创建")
         regen_btn = QPushButton("🔁 生成/刷新命令")
         create_btn = QPushButton("🚀 创建容器")
         create_btn.setProperty("accent", True)
         check_ctr_btn = QPushButton("✅ 检查容器内 UCM")
+        check_ctr_btn.setToolTip(
+            "检查上方「容器名」输入框所指定容器的 UCM 安装情况；\n"
+            "检查对象与详细结果见下方任务记录的标题与日志。")
         regen_btn.clicked.connect(self._regen)
         create_btn.clicked.connect(self._create)
         check_ctr_btn.clicked.connect(self._check_container_ucm)
@@ -227,12 +223,19 @@ class ContainerPage(QWidget):
 
         cmd_layout = QVBoxLayout(cmd_box)
         cmd_layout.setSpacing(4)
-        btns = QHBoxLayout()
-        btns.addWidget(regen_btn)          # 中间操作：生成/刷新
-        btns.addStretch(1)
-        btns.addWidget(check_ctr_btn)      # 结果操作靠右：检查、创建
-        btns.addWidget(create_btn)
-        cmd_layout.addLayout(btns)
+        # 参数输入框在左（固定宽度）、操作按钮在右，合并为一行（节省纵向空间）
+        params_row = QHBoxLayout()
+        params_row.addWidget(QLabel("容器名"))
+        params_row.addWidget(self.name_edit)
+        params_row.addWidget(QLabel("共享内存"))
+        params_row.addWidget(self.shm_edit)
+        params_row.addWidget(QLabel("网络"))
+        params_row.addWidget(self.net_edit)
+        params_row.addStretch(1)
+        params_row.addWidget(regen_btn)
+        params_row.addWidget(check_ctr_btn)
+        params_row.addWidget(create_btn)
+        cmd_layout.addLayout(params_row)
         cmd_layout.addWidget(self.cmd_edit, 1)
 
         self.panel = ParallelTaskPanel()
@@ -249,16 +252,31 @@ class ContainerPage(QWidget):
     def on_enter(self) -> None:
         server = self.ctx.server
         if server is None:
-            self._images = []
-            self._ascend_devices = []
-            self._ascend_mounts = []
-            self._ascend_devices_loading = False
+            self._reset_for_server_switch()
             self.ascend_device_label.setVisible(False)
             fill_image_combo(self.image_combo, [])
             self.ucm_check_label.setText("镜像 UCM：未登录服务器（请回步骤1勾选）")
             return
+        if self._loaded_sid != server.id:
+            self._reset_for_server_switch()
         self._refresh_ascend_devices()
         self._refresh_images()
+
+    def _reset_for_server_switch(self) -> None:
+        """切换服务器：清理上一台的镜像/UCM 校验/设备探测与命令内容。
+
+        不清理的话：下拉框残留上一台的镜像、命令框残留上一台的 docker run
+        （设备节点/容器名都是上一台的），点「创建容器」会按旧命令执行。
+        """
+        self._loaded_sid = None
+        self._images = []
+        self._ucm_state = {}
+        self._ascend_devices = None
+        self._ascend_mounts = None
+        self.ascend_device_label.setVisible(False)
+        fill_image_combo(self.image_combo, [])
+        self.ucm_check_label.setText("镜像 UCM：未校验")
+        self.cmd_edit.clear()
 
     def current_image(self) -> str:
         return combo_ref(self.image_combo)
@@ -556,8 +574,14 @@ class ContainerPage(QWidget):
 
         def on_done(images, error):
             if error is not None:
+                # 获取失败（如新服务器未装 docker）：清空下拉框，
+                # 绝不显示上一台服务器的镜像，避免误导
+                self._images = []
+                fill_image_combo(self.image_combo, [])
+                self.ucm_check_label.setText("✗ 镜像列表获取失败（详见任务记录）")
                 return
             self._images = images or []
+            self._loaded_sid = server.id
             current = self.ctx.images.get(server.id, "")
             fill_image_combo(self.image_combo, self._images, current=current)
             # fill_image_combo 内部 blockSignals，手动触发选中镜像的 UCM 校验
@@ -600,20 +624,29 @@ class ContainerPage(QWidget):
         cmd = text
 
         def fn(ssh, tctx):
-            tctx.progress(20, "创建容器...")
+            tctx.progress(15, "创建容器...")
             cm = ContainerManager(ssh, DockerManager(ssh))
             tctx.log("$ " + cmd.replace("\n", " \\\n"))
-            cm.create(cmd, on_line=tctx.log)
+            try:
+                cm.create(cmd, on_line=tctx.log)
+            except DockerError:
+                # 详细原因（如容器名冲突）已在日志中；状态栏保持简短提示
+                raise DockerError("容器创建失败（详细原因见下方日志）") from None
             name = self.name_edit.text().strip()
             self.ctx.containers[server.id] = name
             tctx.progress(100, f"容器 {name} 已创建")
 
         def on_finished(all_ok: bool) -> None:
             if all_ok:
+                self._create_failed[server.id] = ""
                 QMessageBox.information(
                     self, "完成",
                     f"容器创建完成: {self.name_edit.text().strip()}\n"
                     "可执行「检查容器内 UCM」确认容器可用。")
+            else:
+                # 记录创建失败的容器名：此时服务器上可能存在同名旧容器，
+                # 后续「检查容器内 UCM」针对的将是旧容器，需向用户澄清
+                self._create_failed[server.id] = self.name_edit.text().strip()
 
         self.panel.run_tasks([(server, fn)], "创建容器", on_finished=on_finished)
 
@@ -623,12 +656,30 @@ class ContainerPage(QWidget):
             QMessageBox.information(self, "提示", "请先在步骤1勾选要登录的服务器")
             return
         name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "参数错误", "请先填写容器名")
+            return
+
+        # 创建失败后，同名容器是服务器上已有的旧容器：先确认检查对象，
+        # 避免「创建失败却检查通过」让用户误以为本次创建成功了
+        if self._create_failed.get(server.id) == name:
+            ret = QMessageBox.question(
+                self, "确认检查对象",
+                f"容器 {name} 本次创建未成功，服务器上存在同名旧容器。\n"
+                "继续执行将检查该已有容器的 UCM 安装情况。\n\n是否继续？")
+            if ret != QMessageBox.StandardButton.Yes:
+                return
 
         def fn(ssh, tctx):
             ucm = DockerManager(ssh).container_ucm_info(name)
             tctx.log(f"容器 {name}: {ucm}")
+            if self._create_failed.get(server.id) == name:
+                tctx.log("[deployer] 注意：该容器为服务器上已存在的同名容器，"
+                         "本次创建未成功，以上为该已有容器的检查结果")
             if not ucm.installed:
                 raise RuntimeError(f"容器 {name} 内未检测到 UCM")
             self.ctx.containers[server.id] = name
+            # 状态栏保持简短（过长会把页面拉长）；详细说明见日志
+            return f"容器 {name} 已安装 UCM {ucm.version}"
 
-        self.panel.run_tasks([(server, fn)], "检查容器 UCM")
+        self.panel.run_tasks([(server, fn)], f"检查容器 UCM（{name}）")

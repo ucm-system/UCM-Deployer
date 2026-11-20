@@ -339,8 +339,14 @@ def expected_ucm_components(device: Optional[DeviceInfo], base_image: str,
 
 def validate_whl(filename: str, expected_distribution: str,
                  runtime: Optional[ImageRuntimeInfo] = None,
-                 fallback_arch: str = "") -> tuple:
-    """校验单个 wheel 与基础镜像运行时的匹配性，返回 (errors, warnings)。"""
+                 fallback_arch: str = "",
+                 note_unverified: bool = True) -> tuple:
+    """校验单个 wheel 与基础镜像运行时的匹配性，返回 (errors, warnings)。
+
+    note_unverified=False 时不追加「未能确认…跳过校验」类提示
+    （用于 whl 选择即时反馈——该状态由「等待基础镜像运行时检测」
+    文案兜底，完整提示只在「校验匹配」时给出）。
+    """
     errors: List[str] = []
     warnings: List[str] = []
     name = os.path.basename(filename or "")
@@ -358,15 +364,15 @@ def validate_whl(filename: str, expected_distribution: str,
     elif (wheel_abi.startswith("py") and runtime_abi
           and wheel_abi == "py2" and runtime_abi.startswith("cp3")):
         errors.append(f"{name} 是 Python 2 wheel，与基础镜像 {runtime_abi} 不匹配")
-    elif wheel_abi.startswith("cp") and not runtime_abi:
-        warnings.append(f"未能确认基础镜像 Python 版本，跳过 {name} 的 {wheel_abi} 校验")
+    elif wheel_abi.startswith("cp") and not runtime_abi and note_unverified:
+        warnings.append(f"未能确认基础镜像 Python 版本，跳过 {name} 的 Python 版本校验")
 
     wheel_arch = whl_arch(filename)
     target_arch = (runtime.arch if runtime is not None else "") or fallback_arch
     if wheel_arch and target_arch and wheel_arch != target_arch:
         errors.append(
             f"{name} 架构不匹配：wheel 为 {wheel_arch}，基础镜像为 {target_arch}")
-    elif wheel_arch and not target_arch:
+    elif wheel_arch and not target_arch and note_unverified:
         warnings.append(f"未能确认基础镜像架构，跳过 {name} 的架构校验")
 
     tag = whl_platform_tag(filename)
@@ -379,8 +385,8 @@ def validate_whl(filename: str, expected_distribution: str,
                 map(int, image_glibc.split("."))):
             errors.append(
                 f"{name} 要求 glibc ≥ {required_glibc}，基础镜像为 {image_glibc}")
-    elif required_glibc and not image_glibc:
-        warnings.append(f"未能确认基础镜像 glibc 版本，跳过 {name} 的 manylinux 校验")
+    elif required_glibc and not image_glibc and note_unverified:
+        warnings.append(f"未能确认基础镜像 glibc 版本，跳过 {name} 的 glibc 校验")
     if tag and tag != "any" and "linux" not in tag:
         errors.append(f"{name} 不是 Linux wheel（平台标签 {tag}）")
     return errors, warnings
@@ -503,7 +509,7 @@ def validate_build_match(device: Optional[DeviceInfo], server_arch: str,
         errors.extend(f"{label} {error}" for error in wheel_errors)
         warnings.extend(f"{label} {warning}" for warning in wheel_warnings)
     if not target_arch:
-        warnings.append("未能获取基础镜像/服务器 CPU 架构，已跳过 whl 架构校验")
+        warnings.append("未能确认基础镜像/服务器 CPU 架构，跳过 whl 架构校验")
     if not runtime.probe_ok:
         warnings.append("基础镜像运行时探测不完整，构建前请重点核对 whl 兼容性")
 
@@ -631,16 +637,25 @@ class ImageBuilder:
 
 def upload_image_tar(ssh: SSHClient, docker: DockerManager, local_tar: str,
                      progress: Optional[ProgressFn] = None,
-                     log: Optional[LogFn] = None) -> List[str]:
-    """上传本地镜像 tar/tar.gz 到服务器并 docker load，返回加载出的镜像引用列表。"""
+                     log: Optional[LogFn] = None,
+                     remote_dir: str = "/tmp") -> List[str]:
+    """上传本地镜像 tar/tar.gz 到服务器并 docker load，返回加载出的镜像引用列表。
+
+    remote_dir 为服务器上的保存目录（绝对路径，默认 /tmp）；大镜像包可指定
+    大容量目录（如 /data），避免 /tmp 空间不足。
+    """
     progress = progress or (lambda pct, msg: None)
     log = log or (lambda line: None)
+    remote_dir = (remote_dir or "/tmp").strip() or "/tmp"
+    if not remote_dir.startswith("/"):
+        raise ImageBuildError(
+            f"服务器保存路径必须是绝对路径（以 / 开头）: {remote_dir}")
     if not os.path.isfile(local_tar):
         raise ImageBuildError(f"镜像包不存在: {local_tar}")
     name = os.path.basename(local_tar)
-    remote = f"/tmp/{name}"
+    remote = f"{remote_dir.rstrip('/')}/{name}"
     size = os.path.getsize(local_tar)
-    log(f"上传镜像包: {name} ({size / 1e6:.1f} MB)")
+    log(f"上传镜像包: {name} ({size / 1e6:.1f} MB) -> {remote}")
 
     def cb(sent: int, total: int) -> None:
         progress(int(70 * sent / max(total, 1)),

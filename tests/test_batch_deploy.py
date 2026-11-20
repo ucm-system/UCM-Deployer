@@ -310,6 +310,38 @@ _PRECHECK_OUT = (
 )
 
 
+def test_create_container_custom_command(fake_ssh):
+    """自定义命令模式：整条执行（{image} 替换为镜像引用），跳过逐台设备探测。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    ssh._client.add(r"docker ps", stdout="")
+    ssh._client.add(r"^docker run -itd", stdout="container-id\n")
+
+    tpl = make_template().container
+    tpl.custom_command = (
+        "docker run -itd --name my-ctr --entrypoint /bin/bash "
+        "--net=host -v /data/m:/m {image}")
+    name, cmd = create_container_from_template(ssh, dm, tpl, "ucm-img:1.0")
+    assert name == "my-ctr"          # 容器名从命令 --name 提取
+    assert cmd == ("docker run -itd --name my-ctr --entrypoint /bin/bash "
+                   "--net=host -v /data/m:/m ucm-img:1.0")
+    # 未发生设备探测（fake 中没有注册 uname/npu-smi 脚本也能通过）
+    cmds = [c.executed_command for c in ssh._client.channels]
+    assert not any("npu-smi info" in c for c in cmds)
+
+
+def test_create_container_custom_command_rejects_non_run(fake_ssh):
+    """自定义命令不以 docker run 开头：明确报错。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    tpl = make_template().container
+    tpl.custom_command = "docker ps -a"
+    with pytest.raises(BatchDeployError, match="docker run 开头"):
+        create_container_from_template(ssh, dm, tpl, "ucm-img:1.0")
+
+
 def test_create_container_from_template_ascend(fake_ssh):
     ssh = make_ssh(fake_ssh)
     dm = DockerManager(ssh)
@@ -340,6 +372,7 @@ def test_create_container_from_template_ascend(fake_ssh):
 
 
 def test_create_container_from_template_recreate_removes_old(fake_ssh):
+    """已存在同名容器 + 勾选重建：先 docker rm -f 并验证，再创建。"""
     ssh = make_ssh(fake_ssh)
     dm = DockerManager(ssh)
     ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
@@ -348,13 +381,112 @@ def test_create_container_from_template_recreate_removes_old(fake_ssh):
     ssh._client.add(r"for d in /dev/davinci", stdout="/dev/davinci0\n")
     ssh._client.add(r"for p in /usr/local", stdout="/usr/local/Ascend/driver\n")
     ssh._client.add(r"^docker run -itd", stdout="container-id\n")
-    ssh._client.add(r"^docker rm -f", stdout="", exit_code=1)  # 不存在旧容器
+    ssh._client.add(r"^docker rm -f", stdout="ucm-vllm\n")
+    ssh._client.add(r"^docker ps -a",
+                    stdout="f27204\tucm-vllm\tucm-vllm:0.3.6\tUp 2 hours\n")
 
     tpl = make_template().container
     create_container_from_template(ssh, dm, tpl, "ucm-vllm:0.3.6",
                                    recreate=True)
     cmds = [c.executed_command for c in ssh._client.channels]
     assert any(c == "docker rm -f ucm-vllm" for c in cmds)
+    assert any(c.startswith("docker run -itd") for c in cmds)
+
+
+def test_create_container_from_template_same_name_without_recreate(fake_ssh):
+    """已存在同名容器 + 未勾选重建：明确报错并提示处理方式（不再裸奔到
+    docker run 才暴露 Conflict）。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    ssh._client.add(r"^uname -m", stdout="aarch64\n")
+    ssh._client.add(r"^npu-smi info", stdout=_NPU_SMI)
+    ssh._client.add(r"for d in /dev/davinci", stdout="/dev/davinci0\n")
+    ssh._client.add(r"for p in /usr/local", stdout="/usr/local/Ascend/driver\n")
+    ssh._client.add(r"^docker ps -a",
+                    stdout="f27204\tucm-vllm\tucm-vllm:0.3.6\tUp 2 hours\n")
+
+    tpl = make_template().container
+    with pytest.raises(BatchDeployError, match="同名容器"):
+        create_container_from_template(ssh, dm, tpl, "ucm-vllm:0.3.6")
+    cmds = [c.executed_command for c in ssh._client.channels]
+    assert not any(c.startswith("docker run -itd") for c in cmds)
+
+
+def test_create_container_from_template_rm_failure_reports(fake_ssh):
+    """rm 失败（退出码非零且非 No such container）且容器仍在：明确报错，
+    不继续创建。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    ssh._client.add(r"^uname -m", stdout="aarch64\n")
+    ssh._client.add(r"^npu-smi info", stdout=_NPU_SMI)
+    ssh._client.add(r"for d in /dev/davinci", stdout="/dev/davinci0\n")
+    ssh._client.add(r"for p in /usr/local", stdout="/usr/local/Ascend/driver\n")
+    ssh._client.add(r"^docker rm -f", stderr="cannot remove container",
+                    exit_code=1)
+    ssh._client.add(r"^docker ps -a",
+                    stdout="f27204\tucm-vllm\tucm-vllm:0.3.6\tUp 2 hours\n")
+
+    tpl = make_template().container
+    with pytest.raises(BatchDeployError, match="删除旧容器"):
+        create_container_from_template(ssh, dm, tpl, "ucm-vllm:0.3.6",
+                                       recreate=True)
+    cmds = [c.executed_command for c in ssh._client.channels]
+    assert not any(c.startswith("docker run -itd") for c in cmds)
+
+
+def test_create_container_from_template_run_conflict_fails(fake_ssh):
+    """docker run 失败（退出码非零）：create 抛 BatchDeployError（修复前
+    假成功，流水线会继续执行预检）。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    ssh._client.add(r"^uname -m", stdout="aarch64\n")
+    ssh._client.add(r"^npu-smi info", stdout=_NPU_SMI)
+    ssh._client.add(r"for d in /dev/davinci", stdout="/dev/davinci0\n")
+    ssh._client.add(r"for p in /usr/local", stdout="/usr/local/Ascend/driver\n")
+    ssh._client.add(r"^docker run -itd",
+                    stderr=("docker: Error response from daemon: Conflict. "
+                            'The container name "/ucm-vllm" is already in use'),
+                    exit_code=125)
+
+    tpl = make_template().container
+    with pytest.raises(BatchDeployError, match="创建容器失败"):
+        create_container_from_template(ssh, dm, tpl, "ucm-vllm:0.3.6")
+
+
+def test_create_container_from_template_container_exits(fake_ssh):
+    """容器创建成功但启动即退出：明确报错（含 docker logs 指引），
+    不进入预检（修复前预检报 "Container ... is not running" 晦涩错误）。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    ssh._client.add(r"docker run --rm", stdout="uc-manager==1.2.3\n")
+    ssh._client.add(r"^uname -m", stdout="aarch64\n")
+    ssh._client.add(r"^npu-smi info", stdout=_NPU_SMI)
+    ssh._client.add(r"for d in /dev/davinci", stdout="/dev/davinci0\n")
+    ssh._client.add(r"for p in /usr/local", stdout="/usr/local/Ascend/driver\n")
+    ssh._client.add(r"^docker run -itd", stdout="b86971fd66d1\n")
+    ssh._client.add(r"^docker inspect", stdout="exited|1\n")
+
+    tpl = make_template().container
+    with pytest.raises(BatchDeployError, match="docker logs"):
+        create_container_from_template(ssh, dm, tpl, "ucm-vllm:0.3.6")
+    cmds = [c.executed_command for c in ssh._client.channels]
+    assert not any("ucm-toolkit run precheck" in c for c in cmds)
+
+
+def test_batch_target_report_error_short():
+    """失败报告的 describe 保持简短（提示查看日志），完整原因仅存 error 字段。"""
+    from ucm_deployer.core.batch_deploy import BatchTargetReport
+
+    rep = BatchTargetReport(server_id="s1", server_name="B",
+                            error="预检执行失败: " + "x" * 500)
+    text = rep.describe()
+    assert "执行失败（详见该服务器日志页签）" in text
+    assert "xxx" not in text
+    assert len(text) < 120
+    assert len(rep.error) > 400
 
 
 def test_create_container_from_template_nvidia(fake_ssh):
