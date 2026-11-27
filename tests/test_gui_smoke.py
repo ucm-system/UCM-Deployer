@@ -89,8 +89,11 @@ def test_nav_is_flat_buttons(qapp):
     assert win.nav_group.exclusive()
     for i, btn in enumerate(win._nav_buttons):
         assert btn.objectName() == "navBtn"
-        # 步骤5 之后是「（可选）批量部署」，无编号前缀
-        expected = f"步骤{i + 1}：" if i < 5 else "（可选）批量部署"
+        # 「（可选）批量部署」位于步骤4 与步骤5 之间，无编号前缀
+        if i == 4:
+            expected = "（可选）批量部署"
+        else:
+            expected = f"步骤{i + 1 if i < 4 else i}："
         assert btn.text().startswith(expected)
         assert btn.isCheckable()
     assert win._nav_buttons[0].isChecked()

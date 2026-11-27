@@ -882,3 +882,132 @@ def test_gui_full_flow_with_fake_ssh(qapp, tmp_path):
     assert ctx.scripts is not None
     assert any(s.role == "serve" for s in ctx.scripts.scripts)
     assert ctx.scripts.health_checks
+
+
+def test_server_page_batch_buttons_all_servers(qapp, tmp_path):
+    """批量测试连接/批量环境检测：作用于注册表全部服务器（不只当前勾选）。"""
+    from PySide6.QtCore import Qt
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.server_page import ServerPage
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    ss = []
+    for i in (1, 2):
+        s = ServerInfo.create(name=f"batch-{i}", host="127.0.0.1", port=1,
+                              username="root", password="root")
+        ctx.registry.upsert(s)
+        ss.append(ctx.registry.get(s.id))
+    ctx.selected = [ss[0]]
+    sp = ServerPage(ctx)
+    sp.refresh()
+    sp.table.item(0, 0).setCheckState(Qt.Checked)
+    qapp.processEvents()
+    assert len(ctx.selected) == 1
+
+    # 批量测试连接：面板为两台各建一行，全部成功
+    sp.batch_test_btn.click()
+    qapp.processEvents()
+    assert _wait_panel(sp.panel, qapp), "批量测试连接超时"
+    assert sp.panel.table.rowCount() == 2
+    assert all(sp.panel.table.item(r, 2).text().startswith("✓")
+               for r in range(2))
+
+    # 批量环境检测：两台设备与环境结果都写入共享状态
+    sp.batch_detect_btn.click()
+    qapp.processEvents()
+    assert _wait_panel(sp.panel, qapp, 120), "批量环境检测超时"
+    assert set(ctx.devices) == {s.id for s in ss}
+    assert set(ctx.env_results) == {s.id for s in ss}
+    # 「检测结果」列刷新为总体结论
+    for r in range(2):
+        text = sp.table.item(r, 6).text()
+        assert text in ("PASS", "WARN", "FAIL")
+    sp.close()
+
+
+def test_server_page_env_result_column(qapp, tmp_path):
+    """「检测结果」列：无结果显示未检测（灰），有结果按总体结论着色。"""
+    from PySide6.QtCore import Qt
+
+    from ucm_deployer.core.device_detector import HostEnvItem
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.server_page import ServerPage
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="env-01", host="127.0.0.1", port=1,
+                          username="root", password="root")
+    ctx.registry.upsert(s)
+    s = ctx.registry.get(s.id)
+    ctx.selected = [s]
+    sp = ServerPage(ctx)
+    sp.refresh()
+    assert sp.table.item(0, 6).text() == "未检测"
+
+    env = [
+        HostEnvItem(key="kernel", name="内核版本", status="PASS",
+                    summary="5.10.0"),
+        HostEnvItem(key="docker", name="Docker 版本", status="FAIL",
+                    summary="未检测到", advice="安装 Docker"),
+    ]
+    ctx.env_results[s.id] = env
+    sp.refresh()
+    cell = sp.table.item(0, 6)
+    assert cell.text() == "FAIL"
+    assert "内核版本" in cell.toolTip() and "Docker" in cell.toolTip()
+    assert "未通过项" in cell.toolTip()
+    sp.close()
+
+
+def test_container_page_write_ucm_config(qapp, tmp_path):
+    """步骤3「UCM 文件配置」：写入容器成功后 ctx 记录路径（供步骤5 联动）。"""
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="cfg-01", host="127.0.0.1", port=1,
+                          username="root", password="root")
+    ctx.registry.upsert(s)
+    s = ctx.registry.get(s.id)
+    ctx.selected = [s]
+
+    # MockLinux 先有一个运行中的容器
+    from tests.test_gui_all import LocalScriptSSH
+    LocalScriptSSH(s).exec(
+        "docker run -itd --name ucm-vllm --entrypoint /bin/bash ucm-img:1")
+
+    cp = ContainerPage(ctx)
+    cp.name_edit.setText("ucm-vllm")
+    cp.ucm_cfg_view.setPlainText("ucm_connectors:\n  custom: 1\n")
+    cp.ucm_cfg_path_edit.setText("/workspace/ucm_config_example.yaml")
+    assert s.id not in ctx.ucm_config_paths
+
+    cp._write_ucm_config()
+    assert _wait_panel(cp.panel, qapp, 60), "写入 UCM 配置超时"
+    assert ctx.ucm_config_paths[s.id] == "/workspace/ucm_config_example.yaml"
+    cp.close()
+
+
+def test_container_page_write_ucm_config_guard(qapp, tmp_path):
+    """无容器名时不执行写入任务。"""
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="cfg-02", host="127.0.0.1", port=1,
+                          username="root", password="root")
+    ctx.registry.upsert(s)
+    ctx.selected = [ctx.registry.get(s.id)]
+    cp = ContainerPage(ctx)
+    cp.name_edit.setText("")          # 无容器名
+    cp._write_ucm_config()
+    assert not cp.panel.is_running()
+    cp.close()

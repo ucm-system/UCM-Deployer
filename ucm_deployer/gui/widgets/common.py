@@ -219,7 +219,7 @@ class ParallelTaskPanel(QWidget):
     # shutdown 超时未结束的线程脱离托管（不能 terminate：曾引发进程级 abort）
     _ORPHANS: "ClassVar[set]" = set()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, split_layout: bool = False):
         super().__init__(parent)
         self._threads: List[ServerTaskThread] = []
         self._results: Dict[ServerTaskThread, Tuple[bool, str]] = {}
@@ -279,6 +279,12 @@ class ParallelTaskPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(top)
+        if split_layout:
+            # 拆分布局：结果表留在本面板，日志页签由外部容器负责布局
+            # （如步骤1 的 4:3:3 三段分栏）；_apply_mode 对两者的可见性
+            # 控制不受父容器变化影响
+            layout.addWidget(self.table)
+            return
         layout.addWidget(self.table)
         layout.addWidget(self.tabs, 1)
 

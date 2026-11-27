@@ -106,20 +106,57 @@ def test_detect_includes_arch(fake_ssh):
 
 # ============================================================ 宿主机环境预检
 def test_host_env_all_pass(fake_ssh):
-    """内核 5.10+、Ascend HDK 25.6（>25.2）、SMMU 未开启 -> 全 PASS。"""
+    """内核 5.10+、HDK 25.6、SMMU 未开启、CANN 8.0、内存 32G、Docker 24、
+    shm 512G、AIO 充足（8 卡）-> 全 PASS。"""
     ssh = make_ssh(fake_ssh)
     ssh._client.add(r"^uname -r", stdout="5.10.0-1.el8.aarch64\n")
     ssh._client.add(r"^cat /usr/local/Ascend/driver/version.info",
                     stdout="Version=25.6.rc1.b999\n")
     ssh._client.add(r"^dmesg >/dev/null", exit_code=0)
-    items = check_host_env(ssh)
+    ssh._client.add(r"^head -5 /usr/local/Ascend/ascend_toolkit_install.info",
+                    stdout="version=8.0.RC1\n")
+    ssh._client.add(r"^free -g", stdout=" 32\n")
+    ssh._client.add(r"^docker --version",
+                    stdout="Docker version 24.0.7, build afdb8d4\n")
+    ssh._client.add(r"df -h /dev/shm", stdout="512G\n")
+    ssh._client.add(r"aio-max-nr", stdout="1048576\n")
+    items = check_host_env(ssh, card_count=8)
     by_key = {i.key: i for i in items}
-    assert set(by_key) == {"kernel", "accelerator_driver", "smmu"}
+    assert set(by_key) == {"kernel", "accelerator_driver", "smmu",
+                           "cann", "memory", "docker", "shm", "aio"}
     assert by_key["kernel"].status == "PASS"
     assert "5.10" in by_key["kernel"].summary
     assert by_key["accelerator_driver"].status == "PASS"
     assert by_key["accelerator_driver"].summary == "HDK=25.6.rc1.b999"
     assert by_key["smmu"].status == "PASS"
+    assert by_key["cann"].status == "PASS"
+    assert by_key["cann"].summary == "CANN=8.0.RC1"
+    assert by_key["memory"].status == "PASS"
+    assert by_key["memory"].summary == "32 GB"
+    assert by_key["docker"].status == "PASS"
+    assert "24.0" in by_key["docker"].summary
+    assert by_key["shm"].status == "PASS"
+    assert by_key["shm"].summary == "512 GB"
+    assert by_key["aio"].status == "PASS"
+    assert "32768" in by_key["aio"].summary
+
+
+def test_host_env_shm_and_aio_insufficient(fake_ssh):
+    """shm 256G（< 512G）-> FAIL；AIO 可用 8192（< 8 卡 × 4096）-> WARN。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^uname -r", stdout="5.10.0-1.el8.aarch64\n")
+    ssh._client.add(r"^cat /usr/local/Ascend/driver/version.info",
+                    stdout="Version=25.6.rc1.b999\n")
+    ssh._client.add(r"^dmesg >/dev/null", exit_code=0)
+    ssh._client.add(r"df -h /dev/shm", stdout="256G\n")
+    ssh._client.add(r"aio-max-nr", stdout="8192\n")
+    items = check_host_env(ssh, card_count=8)
+    by_key = {i.key: i for i in items}
+    assert by_key["shm"].status == "FAIL"
+    assert "512 GB" in by_key["shm"].advice
+    assert by_key["aio"].status == "WARN"
+    assert "32768" in by_key["aio"].advice
+    assert "aio-max-nr" in by_key["aio"].advice
 
 
 def test_host_env_kernel_too_old_and_hdk_low(fake_ssh):
@@ -129,12 +166,35 @@ def test_host_env_kernel_too_old_and_hdk_low(fake_ssh):
     ssh._client.add(r"^cat /usr/local/Ascend/driver/version.info",
                     stdout="Version=24.1.rc1\n")
     ssh._client.add(r"^dmesg >/dev/null", exit_code=0)
+    ssh._client.add(r"^head -5 /usr/local/Ascend/ascend_toolkit_install.info",
+                    stdout="version=7.3\n")
+    ssh._client.add(r"^free -g", stdout=" 16\n")
+    ssh._client.add(r"^docker --version",
+                    stdout="Docker version 19.03.15, build xxx\n")
     items = check_host_env(ssh)
     by_key = {i.key: i for i in items}
     assert by_key["kernel"].status == "FAIL"
     assert "5.10" in by_key["kernel"].advice
     assert by_key["accelerator_driver"].status == "WARN"
     assert "25.2" in by_key["accelerator_driver"].advice
+    # 新增检测项的指定范围判定：低于范围 -> WARN
+    assert by_key["cann"].status == "WARN"
+    assert by_key["memory"].status == "WARN"
+    assert by_key["docker"].status == "WARN"
+
+
+def test_host_env_docker_missing(fake_ssh):
+    """无 docker 命令 -> FAIL（容器创建/批量部署的基础依赖）。"""
+    ssh = make_ssh(fake_ssh)
+    ssh._client.add(r"^uname -r", stdout="5.10.0-1.el8.aarch64\n")
+    ssh._client.add(r"^cat /usr/local/Ascend/driver/version.info",
+                    stdout="Version=25.6.rc1.b999\n")
+    ssh._client.add(r"^dmesg >/dev/null", exit_code=0)
+    # docker --version 未注册 -> 127
+    items = check_host_env(ssh)
+    by_key = {i.key: i for i in items}
+    assert by_key["docker"].status == "FAIL"
+    assert "安装 Docker" in by_key["docker"].advice
 
 
 def test_host_env_nvidia_driver(fake_ssh):

@@ -16,8 +16,10 @@ from ucm_deployer.core.batch_deploy import (
     create_container_from_template,
     export_image_tar,
     load_image_tar,
+    load_remote_tar,
     pull_image_on_target,
     run_precheck_on_target,
+    scp_image_between,
     stage_progress_ranges,
     upsert_servers_from_template,
 )
@@ -50,7 +52,6 @@ def make_template() -> DeployTemplate:
         image_ref="ucm-vllm:0.3.6",
         source_host="10.0.0.10",
         source_port=22,
-        skip_existing=True,
         recreate_container=True,
         servers=[
             ServerInfo.create(name="node-1", host="10.0.0.11",
@@ -86,7 +87,6 @@ def test_template_roundtrip_without_secrets():
     restored = DeployTemplate.from_dict(data)
     assert restored.image_ref == "ucm-vllm:0.3.6"
     assert restored.image_mode == "tar"
-    assert restored.skip_existing is True
     assert restored.recreate_container is True
     assert [s.host for s in restored.servers] == ["10.0.0.11", "10.0.0.12"]
     assert restored.servers[0].password == ""     # 密码未导出
@@ -121,6 +121,39 @@ def test_template_save_and_load(tmp_path):
     # 导出的 JSON 便于手工编辑：kind/版本字段存在
     raw = json.loads(open(path, encoding="utf-8").read())
     assert raw["kind"] == TEMPLATE_KIND
+
+
+def test_template_ucm_config_roundtrip():
+    """UCM 文件配置段：round-trip + 旧模板缺段默认关闭。"""
+    from ucm_deployer.core.container_manager import UCM_CONFIG_DEFAULT_PATH
+    from ucm_deployer.core.batch_deploy import BatchUcmConfigConfig
+
+    tpl = make_template()
+    # 旧模板（无 ucm_config 键）导入后默认 disabled、路径取默认值
+    legacy = DeployTemplate.from_dict(make_template().to_dict())
+    assert legacy.ucm_config.enabled is False
+    assert legacy.ucm_config.path == UCM_CONFIG_DEFAULT_PATH
+
+    tpl.ucm_config = BatchUcmConfigConfig(
+        enabled=True, content="ucm_connectors:\n  custom: 1\n",
+        path="/opt/my/ucm.yaml")
+    data = tpl.to_dict()
+    assert data["ucm_config"]["enabled"] is True
+    assert data["ucm_config"]["content"].startswith("ucm_connectors:")
+    restored = DeployTemplate.from_dict(data)
+    assert restored.ucm_config.enabled is True
+    assert restored.ucm_config.content == "ucm_connectors:\n  custom: 1\n"
+    assert restored.ucm_config.path == "/opt/my/ucm.yaml"
+
+    # 校验：内容为空 / 路径非绝对路径
+    bad = BatchUcmConfigConfig(enabled=True, content="   ")
+    with pytest.raises(BatchDeployError):
+        bad.validate()
+    bad = BatchUcmConfigConfig(enabled=True, content="a: 1", path="relative")
+    with pytest.raises(BatchDeployError):
+        bad.validate()
+    # 关闭时不校验
+    BatchUcmConfigConfig(enabled=False, content="").validate()
 
 
 def test_template_precheck_config_import_accepts_object_and_string():
@@ -207,18 +240,19 @@ def test_stage_progress_ranges():
 
 # ============================================================ 镜像分发
 def test_export_image_tar_saves_and_gzips(fake_ssh):
+    """docker save -o 直接导出（不再走 gzip 管道二次压缩，导出更快）。"""
     ssh = make_ssh(fake_ssh)
     dm = DockerManager(ssh)
     ssh._client.add(r"docker image inspect", stdout="")
     ssh._client.add(r"bash -c", stdout="")
     ssh._client.add(r"test -s", stdout="")
 
-    export_image_tar(ssh, dm, "ucm-vllm:0.3.6", "/tmp/pkg.tar.gz")
+    export_image_tar(ssh, dm, "ucm-vllm:0.3.6", "/tmp/pkg.tar")
     cmds = [c.executed_command for c in ssh._client.channels]
     save_cmd = next(c for c in cmds if "docker save" in c)
     assert "bash -c" in save_cmd
-    assert "set -o pipefail" in save_cmd
-    assert "gzip -1 > /tmp/pkg.tar.gz" in save_cmd
+    assert "docker save -o /tmp/pkg.tar" in save_cmd
+    assert "gzip" not in save_cmd
 
 
 def test_export_image_tar_missing_image(fake_ssh):
@@ -266,6 +300,32 @@ def test_load_image_tar_missing_local_file(fake_ssh, tmp_path):
         load_image_tar(ssh, dm, str(tmp_path / "no.tar.gz"), "img:1")
 
 
+def test_load_image_tar_custom_remote_dir(fake_ssh, tmp_path):
+    """目标保存路径可指定大容量目录：上传/load/清理都落在该目录。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    local = tmp_path / "pkg.tar.gz"
+    local.write_bytes(b"fake-tar-data")
+    ssh._client.add(r"^docker load", stdout="Loaded image: ucm-vllm:0.3.6\n")
+    ssh._client.add(r"docker image inspect", stdout="")
+    ssh._client.add(r"rm -f", stdout="")
+    load_image_tar(ssh, dm, str(local), "ucm-vllm:0.3.6", remote_dir="/data/")
+    cmds = [c.executed_command for c in ssh._client.channels]
+    assert any(c.startswith("docker load -i /data/pkg.tar.gz") for c in cmds)
+    assert any(c.startswith("rm -f /data/pkg.tar.gz") for c in cmds)
+    assert ssh._client.files.get("/data/pkg.tar.gz") == b"fake-tar-data"
+
+
+def test_load_image_tar_relative_remote_dir_rejected(fake_ssh, tmp_path):
+    """目标保存路径非绝对路径：直接报错（不上传）。"""
+    ssh = make_ssh(fake_ssh)
+    dm = DockerManager(ssh)
+    local = tmp_path / "pkg.tar.gz"
+    local.write_bytes(b"data")
+    with pytest.raises(BatchDeployError, match="绝对路径"):
+        load_image_tar(ssh, dm, str(local), "img:1", remote_dir="tmp")
+
+
 def test_load_image_tar_verifies_ref_after_load(fake_ssh, tmp_path):
     """docker load 成功但未见预期镜像（如 ref 不匹配）时报错。"""
     ssh = make_ssh(fake_ssh)
@@ -277,6 +337,104 @@ def test_load_image_tar_verifies_ref_after_load(fake_ssh, tmp_path):
     with pytest.raises(BatchDeployError) as exc:
         load_image_tar(ssh, dm, str(local), "ucm-vllm:0.3.6")
     assert "未找到镜像" in str(exc.value)
+
+
+# ============================================================ 服务器直传（scp）
+def test_scp_image_between_with_sshpass(fake_ssh):
+    """源服务器密码认证：目标用 sshpass + scp 拉取；日志不回显密码。"""
+    ssh = make_ssh(fake_ssh)
+    source = ServerInfo.create(name="src", host="10.0.0.5",
+                               username="root", password="s3cret")
+    ssh._client.add(r"which sshpass", stdout="/usr/bin/sshpass\n")
+    ssh._client.add(r"^sshpass", stdout="")
+    logs = []
+    scp_image_between(ssh, source, "/tmp/pkg.tar.gz", "/data/pkg.tar.gz",
+                      log=logs.append)
+    cmds = [c.executed_command for c in ssh._client.channels]
+    scp_cmd = next(c for c in cmds if c.startswith("sshpass"))
+    assert "s3cret" in scp_cmd                      # 实际命令带密码（fake 捕获）
+    assert "-P 22" in scp_cmd
+    assert "root@10.0.0.5:/tmp/pkg.tar.gz" in scp_cmd
+    assert "/data/pkg.tar.gz" in scp_cmd
+    assert all("s3cret" not in l for l in logs)     # 日志打码
+    assert any("sshpass -p ****" in l for l in logs)
+
+
+def test_scp_image_between_askpass_force(fake_ssh):
+    """目标未装 sshpass：自动改用 SSH_ASKPASS 代输（OpenSSH >= 8.4 走 force）；
+    密码脚本 700 权限、日志打码、传输后删除。"""
+    ssh = make_ssh(fake_ssh)
+    source = ServerInfo.create(name="src", host="10.0.0.5",
+                               username="root", password="s3cret")
+    # which sshpass 未注册 -> 127 -> 走 askpass 路径
+    ssh._client.add(r"^ssh -V", stderr="OpenSSH_9.6p1, OpenSSL 1.1.1\n")
+    ssh._client.add(r"^chmod 700 /tmp/.ucm-askpass-", stdout="")
+    ssh._client.add(r"scp -P", stdout="")     # 命令带 SSH_ASKPASS 前缀，非行首
+    ssh._client.add(r"rm -f", stdout="")
+    logs = []
+    scp_image_between(ssh, source, "/tmp/pkg.tar.gz", "/data/pkg.tar.gz",
+                      log=logs.append)
+    cmds = [c.executed_command for c in ssh._client.channels]
+    scp_cmd = next(c for c in cmds if " scp -P 22 " in c)
+    assert "SSH_ASKPASS=/tmp/.ucm-askpass-" in scp_cmd
+    assert "SSH_ASKPASS_REQUIRE=force" in scp_cmd
+    assert "s3cret" not in scp_cmd                  # 密码在脚本里，命令不含
+    assert all("s3cret" not in l for l in logs)     # 日志打码
+    assert any("SSH_ASKPASS=****" in l for l in logs)
+    # 密码脚本已写入（fake sftp files）且传输后被删除
+    written = [k for k in ssh._client.files
+               if ".ucm-askpass-" in k]
+    assert written
+    assert any(c.startswith(f"rm -f {w}") for w in written
+               for c in cmds)
+
+
+def test_scp_image_between_askpass_older_openssh(fake_ssh):
+    """OpenSSH < 8.4：走 setsid 脱离终端方式。"""
+    ssh = make_ssh(fake_ssh)
+    source = ServerInfo.create(name="src", host="10.0.0.5", password="p")
+    ssh._client.add(r"^ssh -V", stderr="OpenSSH_7.4p1\n")
+    ssh._client.add(r"^which setsid", stdout="/usr/bin/setsid\n")
+    ssh._client.add(r"scp -P", stdout="")
+    ssh._client.add(r"rm -f", stdout="")
+    scp_image_between(ssh, source, "/tmp/pkg.tar.gz", "/data/pkg.tar.gz")
+    cmds = [c.executed_command for c in ssh._client.channels]
+    scp_cmd = next(c for c in cmds if " scp -P 22 " in c)
+    assert "SSH_ASKPASS=/tmp/.ucm-askpass-" in scp_cmd
+    assert " setsid scp" in scp_cmd
+    assert "SSH_ASKPASS_REQUIRE" not in scp_cmd
+    # 旧版 OpenSSH 启用 askpass 依赖 DISPLAY 非空（缺失时 scp 会等密码
+    # 直到源端 LoginGraceTime 超时断连，报 Broken pipe）
+    assert "DISPLAY=" in scp_cmd
+
+
+def test_scp_image_between_askpass_no_setsid(fake_ssh):
+    """OpenSSH < 8.4 且无 setsid：明确报错（提示装 sshpass 或改中转）。"""
+    ssh = make_ssh(fake_ssh)
+    source = ServerInfo.create(name="src", host="10.0.0.5", password="p")
+    ssh._client.add(r"^ssh -V", stderr="OpenSSH_7.4p1\n")
+    # which setsid 未注册 -> 127
+    ssh._client.add(r"^chmod 700 /tmp/.ucm-askpass-", stdout="")
+    ssh._client.add(r"rm -f", stdout="")
+    with pytest.raises(BatchDeployError, match="sshpass"):
+        scp_image_between(ssh, source, "/tmp/pkg.tar.gz", "/data/pkg.tar.gz")
+    # 报错后密码脚本也被清理
+    assert any(c.startswith("rm -f /tmp/.ucm-askpass-")
+               for c in (c.executed_command for c in ssh._client.channels))
+
+
+def test_scp_image_between_key_auth_and_failure(fake_ssh):
+    """源服务器密钥认证：直接 scp（无需 sshpass）；scp 失败时清理目标端半成品。"""
+    ssh = make_ssh(fake_ssh)
+    source = ServerInfo.create(name="src", host="10.0.0.5",
+                               auth_type="key", key_path="/id_rsa")
+    ssh._client.add(r"^scp ", exit_code=1, stdout="scp: Permission denied\n")
+    ssh._client.add(r"rm -f", stdout="")
+    with pytest.raises(BatchDeployError, match="scp 传输失败"):
+        scp_image_between(ssh, source, "/tmp/pkg.tar.gz", "/data/pkg.tar.gz")
+    cmds = [c.executed_command for c in ssh._client.channels]
+    assert any(c.startswith("scp -P 22") for c in cmds)   # 无 sshpass
+    assert any(c.startswith("rm -f /data/pkg.tar.gz") for c in cmds)
 
 
 def test_pull_image_on_target(fake_ssh):
@@ -527,7 +685,7 @@ def test_create_container_rejects_unknown_device(fake_ssh):
     with pytest.raises(BatchDeployError) as exc:
         create_container_from_template(
             ssh, dm, make_template().container, "ucm-vllm:0.3.6")
-    assert "未探测到加速设备" in str(exc.value)
+    assert "未检测到加速设备" in str(exc.value)
 
 
 # ============================================================ 预检

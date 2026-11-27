@@ -4,11 +4,9 @@
 
 ## 1. 目标
 
-在 Windows 上提供一个桌面程序（单个 exe），辅助运维人员在一台服务器上的
-vLLM / vLLM-Ascend / SGLang 运行容器中安装 UCM 并完成环境预检，
-覆盖「服务器登录 → 镜像准备 → 容器准备 → 环境预检」流程。
-
-暂缓（架构预留，未实现）：部署配置（PD 拓扑/启动脚本生成）与服务拉起。
+在 Windows 上提供一个桌面程序（单个 exe），辅助运维人员在服务器上的
+vLLM / vLLM-Ascend / SGLang 运行容器中安装 UCM 并完成环境复检，
+覆盖「服务器登录 → UCM镜像准备 → UCM容器部署 → UCM容器环境复检 → 推理服务部署」流程（另有多服务器批量部署）。
 
 ## 2. 技术选型
 
@@ -47,11 +45,12 @@ vLLM / vLLM-Ascend / SGLang 运行容器中安装 UCM 并完成环境预检，
 
 | 步骤 | 功能 | 模块 |
 |---|---|---|
-| 步骤1 | 登录信息保存/复用、单选登录、设备与架构探测 | `server_registry` + `device_detector` + `ssh_client` |
+| 步骤1 | 登录信息保存/复用、单选登录、设备与架构探测、宿主机环境检测（含 CANN/内存/Docker/共享内存/AIO）、批量测试/检测按钮、「检测结果」列 | `server_registry` + `device_detector` + `ssh_client` |
 | 步骤2 | 基础镜像选择（筛选）/上传 tar、上传 wrapt/UCM/ucm-toolkit whl、匹配校验、构建 | `docker_manager` + `image_builder` |
-| 步骤3 | 选 UCM 镜像（自动校验）、全卡映射 docker run 生成/编辑/执行、挂载管理 | `container_manager` |
+| 步骤3 | 选 UCM 镜像（自动校验）、全卡映射 docker run 生成/编辑/执行、挂载管理、UCM 配置文件写入容器（SFTP → docker cp，路径联动步骤5） | `container_manager` |
 | 步骤4 | 容器内 ucm-toolkit precheck（环境检查 + 挂载目录带宽测试，临时子目录自动清理） | `precheck` |
-| 步骤5 | 多服务器批量部署：镜像分发（tar 中转/仓库拉取）+ 容器创建 + 预检；部署数据模板（JSON）导入导出 | `batch_deploy` |
+| （可选）批量部署 | 位于步骤4 与步骤5 之间：多服务器镜像分发（tar 中转/仓库拉取/服务器直传）+ 容器创建（+UCM 配置写入）+ 预检；部署数据模板（JSON）导入导出（含 `ucm_config` 段） | `batch_deploy` |
+| 步骤5 | 推理服务部署：拉起命令模板（`UCM_CONFIG_FILE` 与步骤3 写入路径联动）+ 连通性自动测试（SSH 执行 curl） | `service_page`（GUI） |
 
 导航策略：各步之间**允许自由跳转**（不做前置条件校验）；前置条件
 （已登录服务器/已确定 UCM 镜像/已创建容器）由各步骤内的操作在执行时拦截提示。

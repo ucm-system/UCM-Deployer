@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""步骤3：容器创建 —— 选择 UCM 镜像（选择时自动校验）、docker run 生成/编辑/执行。
+"""步骤3：UCM容器部署 —— 选择 UCM 镜像（选择时自动校验）、docker run 生成/编辑/执行、
+UCM 配置文件写入目标容器。
 
 排版目标：1280x860 一屏可见（无滚动条）——挂载配置合并为一个分组，
 提示文字精简，详细说明放 tooltip。
@@ -30,8 +31,12 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.container_manager import (ContainerCreateConfig,
-                                       ContainerManager, check_shared_fs,
-                                       evaluate_shared_fs)
+                                       ContainerManager,
+                                       UCM_CONFIG_DEFAULT_PATH,
+                                       UCM_CONFIG_TEMPLATE,
+                                       UcmConfigError, check_shared_fs,
+                                       evaluate_shared_fs,
+                                       write_ucm_config_file)
 from ...core.docker_manager import DockerError, DockerManager
 from ...core.models import DeviceType, UCMInfo, VolumeMount
 from ...core.ssh_client import SSHClient
@@ -194,8 +199,8 @@ class ContainerPage(QWidget):
         mount_btns.addStretch(1)
         mount_layout.addLayout(mount_btns)
 
-        # ---------- 3. 容器配置与创建
-        cmd_box = QGroupBox("3. 容器配置与创建")
+        # ---------- 3. 容器配置
+        cmd_box = QGroupBox("3. 容器配置")
         regen_btn = QPushButton("🔁 生成/刷新命令")
         create_btn = QPushButton("🚀 创建容器")
         create_btn.setProperty("accent", True)
@@ -238,14 +243,45 @@ class ContainerPage(QWidget):
         cmd_layout.addLayout(params_row)
         cmd_layout.addWidget(self.cmd_edit, 1)
 
+        # ---------- 4. UCM 文件配置（写入目标容器）
+        cfg_box = QGroupBox("4. UCM 文件配置")
+        self.ucm_cfg_view = QPlainTextEdit(UCM_CONFIG_TEMPLATE)
+        self.ucm_cfg_view.setFont(font)
+        self.ucm_cfg_view.setMinimumHeight(64)
+        self.ucm_cfg_view.setToolTip(
+            "UCM 参数配置文件内容（yaml）。可直接编辑，\n"
+            "「写入容器」时以这里的当前内容为准。")
+        attach_resize_grip(self.ucm_cfg_view)
+        self.ucm_cfg_path_edit = QLineEdit(UCM_CONFIG_DEFAULT_PATH)
+        self.ucm_cfg_path_edit.setFixedWidth(260)
+        self.ucm_cfg_path_edit.setToolTip(
+            "配置文件在容器内的保存路径；写入后步骤5 的拉起命令\n"
+            "UCM_CONFIG_FILE 会自动使用该路径。")
+        self.ucm_cfg_write_btn = QPushButton("💾 写入容器")
+        self.ucm_cfg_write_btn.setToolTip(
+            "把左侧配置内容写入上方「容器名」指定容器（SFTP 上传宿主机临时\n"
+            "文件 → 容器内 mkdir -p → docker cp → 读取校验）。")
+        self.ucm_cfg_write_btn.clicked.connect(self._write_ucm_config)
+        cfg_right = QVBoxLayout()
+        cfg_right.setSpacing(4)
+        cfg_right.addWidget(QLabel("容器内路径"))
+        cfg_right.addWidget(self.ucm_cfg_path_edit)
+        cfg_right.addWidget(self.ucm_cfg_write_btn)
+        cfg_right.addStretch(1)
+        cfg_layout = QHBoxLayout(cfg_box)
+        cfg_layout.setSpacing(8)
+        cfg_layout.addWidget(self.ucm_cfg_view, 1)
+        cfg_layout.addLayout(cfg_right)
+
         self.panel = ParallelTaskPanel()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)              # 模块间留白，强化 1→2→3 顺序感
+        layout.setSpacing(12)              # 模块间留白，强化 1→2→3→4 顺序感
         layout.addWidget(top_box)
         layout.addWidget(mount_box)
         layout.addWidget(cmd_box, 1)
+        layout.addWidget(cfg_box, 1)
         layout.addWidget(self.panel, 2)
 
     # ------------------------------------------------------------ 辅助
@@ -340,6 +376,38 @@ class ContainerPage(QWidget):
         task.signals.sig_done.connect(_cleanup)
         self._quick_tasks.append(task)
         task.start()
+
+    def _write_ucm_config(self) -> None:
+        """把「UCM 文件配置」编辑框内容写入目标容器（模块4）。"""
+        server = self.ctx.server
+        if server is None:
+            QMessageBox.information(self, "提示", "请先在步骤1 勾选登录服务器")
+            return
+        container = self.name_edit.text().strip()
+        path = self.ucm_cfg_path_edit.text().strip()
+        content = self.ucm_cfg_view.toPlainText()
+        if not container:
+            QMessageBox.warning(self, "提示", "请先填写容器名（模块3）")
+            return
+        if not content.strip():
+            QMessageBox.warning(self, "提示", "配置内容为空，请先编辑")
+            return
+
+        def fn(ssh, tctx):
+            write_ucm_config_file(ssh, container, path, content, log=tctx.log)
+            tctx.progress(100, "写入完成")
+
+        def on_finished(all_ok: bool) -> None:
+            if all_ok:
+                self.ctx.ucm_config_paths[server.id] = path
+                QMessageBox.information(
+                    self, "UCM 文件配置",
+                    f"配置已写入容器 {container}：{path}\n"
+                    "步骤5 拉起命令的 UCM_CONFIG_FILE 将使用该路径。")
+
+        self.panel.run_tasks([(server, fn)],
+                             f"写入 UCM 配置文件 → {container}",
+                             on_finished=on_finished)
 
     def _on_image_changed(self, *_) -> None:
         """选择镜像时自动校验镜像内 UCM 安装情况。"""

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """可选：批量部署 —— 在一台源服务器制作镜像后，向多台目标服务器
 分发镜像、创建容器并执行环境预检。仅多台服务器场景需要本功能，
-单台服务器走步骤5（服务部署）在目标容器内一键拉起推理服务。
+单台服务器走步骤5（推理服务拉起）在目标容器内一键拉起推理服务。
 
 - 镜像分发：镜像包中转（源服务器 docker save → 本机 → 目标 docker load）
   或镜像仓库（各目标直接 docker pull）；目标已有同名镜像可跳过；
@@ -17,11 +17,12 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -49,16 +51,22 @@ from ...core.batch_deploy import (
     BatchPrecheckConfig,
     BatchStages,
     BatchTargetReport,
+    BatchUcmConfigConfig,
     DeployTemplate,
     TemplateError,
     create_container_from_template,
     export_image_tar,
     load_image_tar,
+    load_remote_tar,
     pull_image_on_target,
     run_precheck_on_target,
+    scp_image_between,
     stage_progress_ranges,
     upsert_servers_from_template,
+    write_ucm_config_on_target,
 )
+from ...core.container_manager import (UCM_CONFIG_DEFAULT_PATH,
+                                       UCM_CONFIG_TEMPLATE)
 from ...core.docker_manager import DockerManager, validate_image_ref
 from ...core.device_detector import summarize_env_status
 from ...core.models import ServerInfo, VolumeMount
@@ -86,7 +94,7 @@ BANDWIDTH_TIP_NO_KV = (
 
 
 class BatchPage(QWidget):
-    """步骤5 主页面（多服务器批量部署）。"""
+    """（可选）批量部署主页面（位于步骤4 与步骤5 之间）。"""
 
     def __init__(self, ctx: AppContext, parent=None):
         super().__init__(parent)
@@ -96,23 +104,17 @@ class BatchPage(QWidget):
         self._tar_ready = threading.Event()
         self._tar_error = ""
         self._local_tar = ""
+        self._src_tar = ""          # 直传模式：源服务器上的镜像包路径
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)              # 与步骤3/4 一致：模块间顺序感
         layout.addWidget(self._build_template_row())
-        layout.addWidget(self._build_source_box())
+        layout.addWidget(self._build_targets_box())
 
-        # 上半（目标服务器 + 配置模板）与下半（批量执行 + 任务面板）可拖分栏：
-        # 任务启动后进度表 + 各服务器日志需要更多高度，固定 stretch 互相挤压
-        # 会把目标服务器列表压到只剩一行
-        upper = QWidget()
-        upper_lay = QVBoxLayout(upper)
-        upper_lay.setContentsMargins(0, 0, 0, 0)
-        upper_lay.setSpacing(10)
-        upper_lay.addWidget(self._build_targets_box(), 1)
-        upper_lay.addWidget(self._build_config_box(), 2)
+        # 上半（部署配置）与下半（批量执行 + 任务面板）可拖分栏：任务启动后
+        # 进度表 + 各服务器日志需要更多高度，固定 stretch 会把配置模板压扁
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(upper)
+        splitter.addWidget(self._build_config_box())
         splitter.addWidget(self._build_run_box())
         splitter.setStretchFactor(0, 6)
         splitter.setStretchFactor(1, 4)
@@ -127,14 +129,14 @@ class BatchPage(QWidget):
         import_btn = QPushButton("📥 导入部署模板")
         export_btn = QPushButton("📤 导出部署模板")
         import_btn.setToolTip(
-            "从 JSON 数据模板导入：服务器登录信息（写入本机注册表）、\n"
-            "镜像来源、容器创建参数与预检参数一次性填充")
+            "从 JSON 部署模板导入整套配置：服务器登录信息（自动写入服务器管理\n"
+            "并勾选为目标）+ 镜像与分发 + 容器/预检配置 + 执行阶段开关")
         export_btn.setToolTip(
-            "把当前勾选的目标服务器登录信息与镜像/容器/预检配置\n"
-            "导出为 JSON 数据模板，可在其他机器导入复用")
+            "把整套批量部署配置导出为 JSON 模板（密码默认不包含），\n"
+            "供其他电脑导入复用")
         import_btn.clicked.connect(self._import_template)
         export_btn.clicked.connect(self._export_template)
-        hint = QLabel("数据模板 = 登录信息 + 镜像来源 + 容器/预检配置；填一次，导出分享，他机导入即用")
+        hint = QLabel("整套配置（服务器 + 分发 + 容器/预检）导出 JSON，他机导入即用")
         hint.setProperty("role", "hint")
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -144,11 +146,15 @@ class BatchPage(QWidget):
         lay.addWidget(hint, 1)
         return row
 
-    def _build_source_box(self) -> QGroupBox:
-        box = QGroupBox("1. 镜像来源（在一台服务器上已制作好的镜像）")
+    def _build_source_controls(self) -> None:
+        """「镜像与分发」页签的控件（在 _build_config_box 中先建后入页签）。
+
+        分发前自动检查目标已有同名镜像：已存在则跳过上传/导入并在日志说明
+        （分发目标就是让镜像就位，已存在即视为成功，不再提供开关）。"""
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("镜像包中转：源服务器导出 → 本机 → 各目标导入")
         self.mode_combo.addItem("镜像仓库：各目标服务器直接 docker pull")
+        self.mode_combo.addItem("服务器直传：源服务器导出 → 服务器间 scp → 各目标导入")
         self.mode_combo.setCurrentIndex(0)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
@@ -158,69 +164,84 @@ class BatchPage(QWidget):
         self.image_ref_edit.setPlaceholderText(
             "镜像引用，如 ucm-vllm:v0.3.6（进入本页自动带入步骤2构建结果）")
         self.image_ref_edit.setMinimumWidth(300)
-        self.skip_existing_check = QCheckBox("目标已存在同名镜像时跳过分发")
-        self.skip_existing_check.setChecked(True)
-        self.skip_existing_check.setToolTip(
-            "勾选后逐台检查 docker image inspect：已存在则跳过上传/拉取，\n"
- "直接进入容器创建（适合增量补装或重复执行）")
+        self.image_ref_edit.setToolTip(
+            "创建容器与预检都使用此镜像。\n"
+            "未勾选「分发镜像」阶段时，此镜像须已存在于各目标服务器。")
+        self.tar_remote_edit = QLineEdit("/tmp")
+        self.tar_remote_edit.setToolTip(
+            "镜像包上传到各目标服务器后的保存目录（绝对路径）。\n"
+            "docker load 校验完成后会自动删除该临时包；\n"
+            "大镜像包建议指定大容量目录（如 /data），避免 /tmp 空间不足。")
 
-        form = QFormLayout(box)
-        form.addRow("分发方式", self.mode_combo)
-        form.addRow("源服务器", self.source_combo)
+    def _build_source_tab(self) -> QWidget:
+        """「镜像与分发」页签：镜像从哪来 + 分发方式 + 目标保存路径。
+
+        分发相关控件集中在 _distribute_widget（取消「分发镜像」阶段时
+        整体禁用）；镜像名始终可编辑——创建容器/预检都要用它。"""
+        page = QWidget()
+        form = QFormLayout(page)
+        self._source_hint = QLabel("")
+        self._source_hint.setProperty("role", "hint")
+        self._source_hint.setWordWrap(True)
+        form.addRow(self._source_hint)
+        self._distribute_widget = QWidget()
+        dform = QFormLayout(self._distribute_widget)
+        dform.setContentsMargins(0, 0, 0, 0)
+        dform.addRow("分发方式", self.mode_combo)
+        dform.addRow("源服务器", self.source_combo)
+        dform.addRow("目标保存路径", self.tar_remote_edit)
+        form.addRow(self._distribute_widget)
         form.addRow("镜像", self.image_ref_edit)
-        opts = QHBoxLayout()
-        opts.addWidget(self.skip_existing_check)
-        opts.addStretch(1)
-        form.addRow("", opts)
-        return box
+        return page
 
     def _build_targets_box(self) -> QGroupBox:
-        box = QGroupBox("2. 目标服务器（来自步骤1「服务器管理」，勾选多台）")
-        select_all_btn = QPushButton("全选")
-        clear_btn = QPushButton("清空")
-        refresh_btn = QPushButton("🔄 刷新")
-        refresh_btn.setToolTip(
-            "从步骤1「服务器管理」重新读取服务器列表（本页不单独维护服务器，\n"
-            "增删改请回步骤1 操作后点此同步）")
-        select_all_btn.clicked.connect(lambda: self._set_all_targets(True))
-        clear_btn.clicked.connect(lambda: self._set_all_targets(False))
-        refresh_btn.clicked.connect(self.refresh_servers)
-
+        box = QGroupBox("1. 目标服务器（勾选多台，来自步骤1「服务器管理」）")
+        # 勾选交互（不再放全选/清空/刷新按钮，减少控件堆砌）：
+        # - 点击行任意位置切换该台的部署勾选（勾选行整行高亮，足够显眼）；
+        # - 点「部署」列表头 = 全选 / 清空（列头带 ☑/◐/☐ 三态标记）；
+        # - 表格空白处右键 = 全选 / 清空 / 刷新列表
         self.target_table = QTableWidget(0, 6)
         self.target_table.setHorizontalHeaderLabels(
             ["部署", "名称", "地址", "用户", "设备", "环境"])
         header = self.target_table.horizontalHeader()
+        # 「部署」勾选列窄列，其余列平均分配宽度（用户偏好：先平均，
+        # 需要时再手动拖动调整）
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        for col in (1, 2, 3, 4, 5):
+            header.setSectionResizeMode(col, QHeaderView.Stretch)
+        header.setSectionsClickable(True)
+        self.target_table.horizontalHeaderItem(0).setToolTip(
+            "点击列头：全选 / 清空全部目标")
         self.target_table.horizontalHeaderItem(5).setToolTip(
-            "步骤1「探测设备」时宿主机环境预检的汇总结果：\n"
+            "步骤1「环境检测」时宿主机环境检测的汇总结果：\n"
             "PASS=全部通过（可放心用于批量部署）；WARN=有建议关注项；\n"
-            "FAIL=有不满足项（建议先修复）；未探测=尚未执行步骤1「探测设备」")
+            "FAIL=有不满足项（建议先修复）；未检测=尚未执行步骤1「环境检测」")
         self.target_table.verticalHeader().setVisible(False)
         self.target_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.target_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.target_table.setAlternatingRowColors(True)
+        self.target_table.setToolTip(
+            "点击行任意位置即可勾选/取消该台目标；\n"
+            "点「部署」列表头全选或清空；右键菜单可刷新列表")
         # 至少可见 3 行目标服务器（旧版 max=126 且被任务面板挤压后只剩 1 行）
-        self.target_table.setMinimumHeight(120)
+        self.target_table.setMinimumHeight(114)
         self.target_table.itemChanged.connect(self._on_target_item_changed)
+        # 点击行任意位置切换勾选（第 0 列 checkbox 自带切换，避免重复翻转）
+        self.target_table.cellClicked.connect(self._on_target_row_clicked)
+        header.sectionClicked.connect(self._on_target_header_clicked)
+        # 右键菜单：全选 / 清空 / 刷新
+        self.target_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.target_table.customContextMenuRequested.connect(
+            self._show_target_menu)
 
         self.target_count_label = QLabel("已选 0 台")
         self.target_count_label.setProperty("role", "hint")
         source_hint = QLabel(
-            "服务器列表与步骤1「服务器管理」完全一致：在步骤1 新增/编辑后点「🔄 刷新」即可同步")
+            "列表与步骤1「服务器管理」完全一致：步骤1 增删改后右键「刷新列表」同步")
         source_hint.setProperty("role", "hint")
 
-        btns = QHBoxLayout()
-        for b in (select_all_btn, clear_btn, refresh_btn):
-            btns.addWidget(b)
-        btns.addStretch(1)
         lay = QVBoxLayout(box)
         lay.setSpacing(4)
-        lay.addLayout(btns)
         lay.addWidget(self.target_table, 1)
         count_row = QHBoxLayout()
         count_row.addWidget(self.target_count_label)
@@ -230,13 +251,82 @@ class BatchPage(QWidget):
         return box
 
     def _build_config_box(self) -> QGroupBox:
-        box = QGroupBox("3. 部署配置模板（对全部目标生效，设备差异自动适配）")
+        box = QGroupBox("2. 部署配置（对全部目标生效，设备差异自动适配）")
+        # 三个执行阶段开关集中放页签栏右上角（一组可选步骤，风格统一）：
+        # 分发镜像 / 创建容器 / 环境预检——取消勾选则跳过对应阶段，
+        # 勾选变化实时刷新模块3 的执行说明
+        self.stage_image_check = QCheckBox("分发镜像")
+        self.stage_image_check.setToolTip(
+            "勾选 = 批量执行时包含「镜像分发」阶段；\n"
+            "取消勾选则跳过分发（镜像须已存在于目标服务器），仅创建容器/预检")
+        self.stage_container_check = QCheckBox("创建容器并配置UCM文件")
+        self.stage_container_check.setToolTip(
+            "勾选 = 批量执行时为每台目标创建容器（「容器配置」页签）并在创建\n"
+            "完成后写入 UCM 配置文件（「UCM文件配置」页签，容器名即「容器配置」\n"
+            "页签中的容器名，全目标统一）；写入失败会导致该台目标部署失败。\n"
+            "取消勾选则跳过容器创建，且「容器配置」「UCM文件配置」两页签均不可选中")
+        self.stage_precheck_check = QCheckBox("环境预检")
+        self.stage_precheck_check.setToolTip(
+            "勾选 = 批量执行时包含「环境预检」阶段")
+        for c in (self.stage_image_check, self.stage_container_check,
+                  self.stage_precheck_check):
+            c.setChecked(True)
+
+        # 镜像来源控件先建（模式切换联动依赖），再作为首个页签加入
+        self._build_source_controls()
+
         self.config_tabs = QTabWidget()
+        self.config_tabs.addTab(self._build_source_tab(), "镜像与分发")
         self.config_tabs.addTab(self._build_container_tab(), "容器配置")
+        self.config_tabs.addTab(self._build_ucm_cfg_tab(), "UCM文件配置")
         self.config_tabs.addTab(self._build_precheck_tab(), "预检配置")
+        corner = QWidget()
+        corner_lay = QHBoxLayout(corner)
+        corner_lay.setContentsMargins(0, 0, 8, 0)
+        corner_lay.setSpacing(12)
+        corner_lay.addWidget(self.stage_image_check)
+        corner_lay.addWidget(self.stage_container_check)
+        corner_lay.addWidget(self.stage_precheck_check)
+        self.config_tabs.setCornerWidget(corner, Qt.TopRightCorner)
+        # 取消勾选 -> 对应页签置灰（不可编辑），配置仍保留
+        # 「镜像与分发」页签特殊：页签保持可编辑（镜像名始终要填——
+        # 创建容器/预检都使用它），只禁用其中的分发参数区
+        # 「容器配置」与「UCM文件配置」两页签随右上角「创建容器并配置
+        # UCM 文件」开关联动（取消时均不可选中）
+        self.stage_image_check.toggled.connect(self._on_image_stage_toggled)
+        self.stage_container_check.toggled.connect(
+            self._update_config_tab_states)
+        self.stage_precheck_check.toggled.connect(
+            lambda on: self.config_tabs.setTabEnabled(3, on))
+        # 勾选变化 -> 模块3 执行说明实时刷新
+        self.stage_image_check.toggled.connect(self._update_exec_summary)
+        self.stage_container_check.toggled.connect(self._update_exec_summary)
+        self.stage_precheck_check.toggled.connect(self._update_exec_summary)
+        # 初始页签状态同步（「创建容器并配置UCM文件」默认勾选）
+        self._update_config_tab_states()
+
         lay = QVBoxLayout(box)
         lay.addWidget(self.config_tabs)
         return box
+
+    def _update_config_tab_states(self) -> None:
+        """右上角「创建容器并配置UCM文件」联动容器配置/UCM文件配置两页签。
+
+        - 未勾选：两页签均不可选中（点击无效，配置保留，页内控件不禁用）；
+        - 勾选：批量执行时创建容器（「容器配置」页签）并在每台容器创建
+          完成后写入 UCM 配置（「UCM文件配置」页签）。"""
+        on = self.stage_container_check.isChecked()
+        bar = self.config_tabs.tabBar()
+        bar.setTabEnabled(1, on)
+        bar.setTabEnabled(2, on)
+
+    def _on_image_stage_toggled(self, on: bool) -> None:
+        """取消「分发镜像」时只禁用分发参数区；镜像名保持可编辑。"""
+        self._distribute_widget.setEnabled(on)
+        self._source_hint.setText(
+            "" if on else
+            "未勾选「分发镜像」：镜像须已存在于各目标服务器，"
+            "创建容器与预检将直接使用下方镜像名")
 
     def _build_container_tab(self) -> QWidget:
         page = QWidget()
@@ -251,7 +341,7 @@ class BatchPage(QWidget):
         self.shm_edit.setFixedWidth(80)
         self.net_edit.setFixedWidth(90)
         self.ports_edit.setFixedWidth(130)
-        self.name_edit.setToolTip("docker 容器名（--name）；步骤4 按此名找到容器")
+        self.name_edit.setToolTip("docker 容器名（--name）；步骤4 复检按此名找到容器")
         self.shm_edit.setToolTip("容器共享内存（--shm-size）；vLLM 需要大共享内存，默认 512g")
         self.net_edit.setToolTip("host = 共享宿主机网络（Ascend 推荐）；NVIDIA 容器用端口映射")
         self.ports_edit.setToolTip("docker -p 端口映射（NVIDIA 容器使用，逗号分隔多个）")
@@ -265,6 +355,12 @@ class BatchPage(QWidget):
         row1.addWidget(QLabel("端口映射"))
         row1.addWidget(self.ports_edit)
         row1.addStretch(1)
+        # 同名容器先删除再创建（容器创建行为，随「容器配置」同处）
+        self.recreate_check = QCheckBox("同名容器先删除再创建")
+        self.recreate_check.setToolTip(
+            "重复执行批量部署时，目标服务器上已存在同名容器会导致 docker run 失败；\n"
+            "勾选后在创建前先 docker rm -f 删除旧容器")
+        row1.addWidget(self.recreate_check)
         lay.addLayout(row1)
 
         # 统一挂载表（与步骤3 一致）：KV Cache / 模型 / 自定义，一套按钮
@@ -296,6 +392,12 @@ class BatchPage(QWidget):
             "默认表为空（即不挂载任何目录）；需要挂载模型时选择类型后添加。")
         mount_del_btn = QPushButton("🗑 移除选中")
         mount_del_btn.clicked.connect(self._mount_del)
+        mount_verify_btn = QPushButton("🔎 批量校验")
+        mount_verify_btn.setToolTip(
+            "对全部勾选的目标服务器逐一检查挂载表中每个宿主机路径是否存在\n"
+            "（test -d），结果写入各服务器日志页签；分发/创建前先校验可\n"
+            "避免因目录缺失导致的挂载失败。")
+        mount_verify_btn.clicked.connect(self._mount_verify)
         # 挂载表变化联动「执行存储带宽检查」可用性（需存在 KV Cache 目录）
         mount_model = self.mount_table.model()
         mount_model.rowsInserted.connect(self._update_bandwidth_state)
@@ -309,13 +411,14 @@ class BatchPage(QWidget):
         add_row.addWidget(QLabel("→ 容器内"))
         add_row.addWidget(self.mount_container_edit, 1)
         add_row.addWidget(mount_add_btn)
+        add_row.addWidget(mount_verify_btn)
         add_row.addWidget(mount_del_btn)
         lay.addLayout(add_row)
         lay.addWidget(self.mount_table)
 
-        # 附加参数
-        extra_args_label = QLabel("附加 docker run 参数（每行一项，追加到命令末尾）")
-        extra_args_label.setProperty("role", "hint")
+        # 附加参数（与「自定义 docker run 命令」互斥：勾选自定义后置灰）
+        self.extra_args_label = QLabel("附加 docker run 参数（每行一项，追加到命令末尾）")
+        self.extra_args_label.setProperty("role", "hint")
         self.extra_args_edit = QPlainTextEdit()
         self.extra_args_edit.setFixedHeight(28)
         attach_resize_grip(self.extra_args_edit)   # 右下角拖动调整高度
@@ -323,7 +426,7 @@ class BatchPage(QWidget):
         font = QFont("Consolas")
         font.setStyleHint(QFont.Monospace)
         self.extra_args_edit.setFont(font)
-        lay.addWidget(extra_args_label)
+        lay.addWidget(self.extra_args_label)
         lay.addWidget(self.extra_args_edit)
 
         # ---- 自定义 docker run 命令（可选；所有目标使用同一条）
@@ -370,6 +473,8 @@ class BatchPage(QWidget):
         self.custom_cmd_check.toggled.connect(self.custom_cmd_edit.setEnabled)
         self.custom_cmd_check.toggled.connect(
             self.custom_cmd_generate_btn.setEnabled)
+        # 两种命令模式互斥：勾选自定义命令后附加参数不再参与执行 -> 置灰提示
+        self.custom_cmd_check.toggled.connect(self._on_custom_cmd_toggled)
 
         def _toggle_custom(show: bool) -> None:
             for w in self.custom_cmd_widgets:
@@ -381,6 +486,69 @@ class BatchPage(QWidget):
         lay.addLayout(gen_row)
         lay.addWidget(hint_label)
         return page
+
+    def _on_custom_cmd_toggled(self, on: bool) -> None:
+        """勾选自定义 docker run 命令后，附加参数不再参与执行 -> 置灰提示。"""
+        self.extra_args_edit.setEnabled(not on)
+        self.extra_args_label.setEnabled(not on)
+        self.extra_args_edit.setToolTip(
+            "已启用「自定义 docker run 命令」，附加参数不再参与执行；\n"
+            "需要附加参数请取消勾选自定义命令" if on else "")
+
+    def _build_ucm_cfg_tab(self) -> QWidget:
+        """「UCM文件配置」页签：容器创建完成后批量写入 UCM 配置文件。
+
+        是否写入由右上角「创建容器并配置UCM文件」阶段开关决定
+        （创建容器即写入）；本页签只负责配置内容与路径。"""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setSpacing(4)
+
+        hint = QLabel(
+            "UCM 配置文件参考默认配置如下，按实际存储环境修改；"
+            "是否写入由页签栏右上角「创建容器并配置UCM文件」开关决定"
+            "（创建容器后即写入）。写入目标容器即「容器配置」页签中的容器名"
+            "（全目标统一），写入路径须与步骤5 拉起命令的 "
+            "<code>UCM_CONFIG_FILE</code> 一致。"
+            "内容为空时保存模板按钮可恢复默认。")
+        hint.setTextFormat(Qt.RichText)
+        hint.setWordWrap(True)
+        hint.setProperty("role", "hint")
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.Monospace)
+        self.ucm_cfg_view = QPlainTextEdit(UCM_CONFIG_TEMPLATE)
+        self.ucm_cfg_view.setFont(font)
+        self.ucm_cfg_view.setMinimumHeight(120)
+        self.ucm_cfg_view.setToolTip(
+            "UCM 参数配置文件内容（yaml）。可直接编辑，\n"
+            "批量写入时以这里的当前内容为准。")
+        attach_resize_grip(self.ucm_cfg_view)
+        self.ucm_cfg_path_edit = QLineEdit(UCM_CONFIG_DEFAULT_PATH)
+        self.ucm_cfg_path_edit.setFixedWidth(280)
+        self.ucm_cfg_path_edit.setToolTip(
+            "配置文件在各目标容器内的保存路径（须为绝对路径）。")
+        self.ucm_cfg_restore_btn = QPushButton("🔁 恢复默认模板")
+        self.ucm_cfg_restore_btn.setToolTip("把编辑框内容恢复为参考默认配置")
+        self.ucm_cfg_restore_btn.clicked.connect(
+            lambda: self.ucm_cfg_view.setPlainText(UCM_CONFIG_TEMPLATE))
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("容器内路径"))
+        path_row.addWidget(self.ucm_cfg_path_edit)
+        path_row.addSpacing(12)
+        path_row.addWidget(self.ucm_cfg_restore_btn)
+        path_row.addStretch(1)
+
+        lay.addWidget(hint)
+        lay.addWidget(self.ucm_cfg_view, 1)
+        lay.addLayout(path_row)
+        return page
+
+    def _build_ucm_cfg_template(self) -> BatchUcmConfigConfig:
+        """收集「UCM文件配置」页签参数（是否写入随创建容器阶段开关）。"""
+        return BatchUcmConfigConfig(
+            enabled=self.stage_container_check.isChecked(),
+            content=self.ucm_cfg_view.toPlainText(),
+            path=self.ucm_cfg_path_edit.text().strip())
 
     def _build_precheck_tab(self) -> QWidget:
         page = QWidget()
@@ -428,35 +596,28 @@ class BatchPage(QWidget):
         self.custom_cfg_edit.setMinimumHeight(84)
         self.custom_cfg_edit.setPlainText(DEFAULT_PRECHECK_TEMPLATE)
         self.custom_cfg_edit.textChanged.connect(self._validate_precheck_json)
+        # 与容器配置「自定义 docker run 命令」同理：未勾选「使用自定义预检配置」
+        # 时编辑框置灰（内容仍可见，作为参考模板），勾选后启用
+        self.custom_cfg_edit.setEnabled(self.custom_cfg_check.isChecked())
+        self.custom_cfg_check.toggled.connect(self.custom_cfg_edit.setEnabled)
         lay.addWidget(self.custom_cfg_edit, 1)
         self._update_bandwidth_state()
         return page
 
     def _build_run_box(self) -> QGroupBox:
-        box = QGroupBox("4. 批量执行（每台目标：分发 → 创建 → 预检，进度与日志按服务器分列）")
-        self.stage_image_check = QCheckBox("镜像分发")
-        self.stage_container_check = QCheckBox("容器创建")
-        self.stage_precheck_check = QCheckBox("环境预检")
-        for c in (self.stage_image_check, self.stage_container_check,
-                  self.stage_precheck_check):
-            c.setChecked(True)
-        self.recreate_check = QCheckBox("同名容器先删除再创建")
-        self.recreate_check.setToolTip(
-            "重复执行批量部署时，目标服务器上已存在同名容器会导致 docker run 失败；\n"
-            "勾选后在创建前先 docker rm -f 删除旧容器")
-
+        box = QGroupBox("3. 批量执行（进度与日志按服务器分页展示）")
         self.run_btn = QPushButton("🚀 开始批量部署")
         self.run_btn.setProperty("accent", True)
         self.run_btn.clicked.connect(self._run)
+        # 动态说明：汇总各模块勾选的执行阶段与目标台数
+        # （阶段开关分散在模块1/3 标题处，本区块只保留主操作）
+        self.exec_summary_label = QLabel("")
+        self.exec_summary_label.setProperty("role", "hint")
 
-        stages_row = QHBoxLayout()
-        stages_row.addWidget(QLabel("执行阶段："))
-        stages_row.addWidget(self.stage_image_check)
-        stages_row.addWidget(self.stage_container_check)
-        stages_row.addWidget(self.stage_precheck_check)
-        stages_row.addWidget(self.recreate_check)
-        stages_row.addStretch(1)
-        stages_row.addWidget(self.run_btn)
+        exec_row = QHBoxLayout()
+        # 主按钮靠右（与页面其他操作按钮位置一致），左侧放动态说明
+        exec_row.addWidget(self.exec_summary_label, 1)
+        exec_row.addWidget(self.run_btn)
 
         self.panel = ParallelTaskPanel()
         # 批量页定制任务面板高度：进度表至少可见 2 行、超过 ~8 行滚动查看；
@@ -466,7 +627,7 @@ class BatchPage(QWidget):
         self.panel.tabs.setMinimumHeight(136)
         lay = QVBoxLayout(box)
         lay.setSpacing(6)
-        lay.addLayout(stages_row)
+        lay.addLayout(exec_row)
         lay.addWidget(self.panel, 1)
         return box
 
@@ -538,8 +699,8 @@ class BatchPage(QWidget):
         self._update_target_count()
 
     def _make_env_item(self, server_id: str) -> QTableWidgetItem:
-        """「环境」列单元格：步骤1 探测设备时环境预检的汇总状态
-        （PASS 绿 / WARN 橙 / FAIL 红 / 未探测灰；悬浮显示各项明细）。"""
+        """「环境」列单元格：步骤1 环境检测时宿主机检测的汇总状态
+        （PASS 绿 / WARN 橙 / FAIL 红 / 未检测灰；悬浮显示各项明细）。"""
         env = self.ctx.env_results.get(server_id) or []
         summary = summarize_env_status(env)
         item = QTableWidgetItem(summary or "未探测")
@@ -560,14 +721,15 @@ class BatchPage(QWidget):
 
     def _on_mode_changed(self) -> None:
         pull_mode = self.mode_combo.currentIndex() == 1
-        self.source_combo.setEnabled(not pull_mode)
+        # 仓库拉取不经镜像包：无需源服务器，也不涉及目标保存路径
+        self.source_combo.setEnabled(self.mode_combo.currentIndex() != 1)
+        self.tar_remote_edit.setEnabled(not pull_mode)
         if pull_mode:
             self.image_ref_edit.setPlaceholderText(
                 "镜像仓库地址，如 quay.io/ascend/vllm-ascend:v0.30.0rc2")
         else:
             self.image_ref_edit.setPlaceholderText(
                 "镜像引用，如 ucm-vllm:v0.3.6（进入本页自动带入步骤2构建结果）")
-
     def _on_target_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
             return
@@ -582,6 +744,56 @@ class BatchPage(QWidget):
             self._target_ids.discard(server_id)
         self._update_target_count()
 
+    def _target_checkable_rows(self) -> int:
+        """表格中可勾选的行数（空状态引导行不可勾选，不计入）。"""
+        return sum(
+            1 for row in range(self.target_table.rowCount())
+            if self.target_table.item(row, 0) is not None
+            and self.target_table.item(row, 0).flags() & Qt.ItemIsUserCheckable)
+
+    def _on_target_row_clicked(self, row: int, col: int) -> None:
+        """点击行任意位置 = 切换该台的部署勾选（第 0 列 checkbox 自带切换，
+        避免重复翻转）——勾选不必瞄准小方框。"""
+        if col == 0:
+            return
+        item = self.target_table.item(row, 0)
+        if item is None or not (item.flags() & Qt.ItemIsUserCheckable):
+            return    # 空状态引导行
+        item.setCheckState(
+            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+
+    def _on_target_header_clicked(self, col: int) -> None:
+        """点「部署」列表头 = 全选 / 清空（按当前是否已全部勾选取反）。"""
+        if col != 0:
+            return
+        total = self._target_checkable_rows()
+        all_checked = total > 0 and len(self._target_ids) >= total
+        self._set_all_targets(not all_checked)
+
+    def _show_target_menu(self, pos) -> None:
+        """表格右键菜单：全选 / 清空 / 刷新列表（替代原顶部按钮行）。"""
+        menu = QMenu(self)
+        menu.addAction("全选", lambda: self._set_all_targets(True))
+        menu.addAction("清空", lambda: self._set_all_targets(False))
+        menu.addSeparator()
+        menu.addAction("刷新列表", self.refresh_servers)
+        menu.exec(self.target_table.viewport().mapToGlobal(pos))
+
+    def _refresh_target_marks(self) -> None:
+        """勾选行整行浅蓝高亮（覆盖隔行底色），与「已选 N 台」互相印证。"""
+        for row in range(self.target_table.rowCount()):
+            item0 = self.target_table.item(row, 0)
+            if item0 is None or not (item0.flags() & Qt.ItemIsUserCheckable):
+                continue    # 空状态引导行
+            checked = item0.checkState() == Qt.Checked
+            for col in range(1, 6):
+                it = self.target_table.item(row, col)
+                if it is not None:
+                    # 取消勾选用空画刷清除高亮（不能用 QColor()——无效色会被
+                    # 渲染成黑色）
+                    it.setBackground(QBrush(QColor("#eaf2ff")) if checked
+                                     else QBrush())
+
     def _set_all_targets(self, checked: bool) -> None:
         servers = self.ctx.registry.list_servers()
         if not servers:
@@ -594,6 +806,39 @@ class BatchPage(QWidget):
 
     def _update_target_count(self) -> None:
         self.target_count_label.setText(f"已选 {len(self._target_ids)} 台")
+        self._refresh_target_marks()
+        self._update_exec_summary()
+
+    def _update_exec_summary(self) -> None:
+        """模块4 的动态说明：汇总各模块勾选的执行阶段与目标台数。"""
+        stages = []
+        if self.stage_image_check.isChecked():
+            stages.append("分发镜像")
+        # 「创建容器并配置UCM文件」开关勾选 = 创建容器阶段开启，
+        # 且每台容器创建完成后写入 UCM 配置（两步合一）
+        if self.stage_container_check.isChecked():
+            stages.append("创建容器并配置UCM文件")
+        if self.stage_precheck_check.isChecked():
+            stages.append("环境预检")
+        n = len(self._target_ids)
+        if not stages:
+            text = "未勾选任何执行阶段（勾选模块2 右上角的阶段开关）"
+        elif n == 0:
+            text = "已选阶段：" + " → ".join(stages) + "（请先勾选目标服务器）"
+        else:
+            text = f"将对 {n} 台目标执行：" + " → ".join(stages)
+        self.exec_summary_label.setText(text)
+
+    @staticmethod
+    def _image_exists_on(ssh, image_ref: str) -> bool:
+        """目标侧镜像存在性检查（分发前自动检测，已有则跳过分发并在日志说明）。
+
+        命令用 --format 形式，与源服务器侧 docker image inspect 可区分
+        （exit 0 = 已存在）。"""
+        res = ssh.exec(
+            f"docker image inspect --format='{{{{.Id}}}}' {shq(image_ref)}",
+            timeout=30)
+        return getattr(res, "exit_code", 1) == 0
 
     def _selected_targets(self) -> List[ServerInfo]:
         selected = []
@@ -662,6 +907,61 @@ class BatchPage(QWidget):
         row = self.mount_table.currentRow()
         if row >= 0:
             self.mount_table.removeRow(row)
+
+    def _mount_paths(self) -> List[str]:
+        """挂载表中全部非空宿主机路径（按行序去重）。"""
+        paths: List[str] = []
+        for row in range(self.mount_table.rowCount()):
+            item = self.mount_table.item(row, 1)
+            if item is None:
+                continue
+            path = item.text().strip()
+            if path and path not in paths:
+                paths.append(path)
+        return paths
+
+    def _mount_verify(self) -> None:
+        """对全部勾选目标并行校验挂载路径是否存在（test -d）。"""
+        paths = self._mount_paths()
+        if not paths:
+            QMessageBox.information(
+                self, "提示", "挂载表为空——请先添加需要校验的宿主机路径")
+            return
+        servers = self._selected_targets()
+        if not servers:
+            QMessageBox.warning(
+                self, "未选择目标服务器",
+                "请先在「1. 目标服务器」勾选要校验的服务器")
+            return
+
+        def fn(ssh, tctx):
+            ok_n = 0
+            missing: List[str] = []
+            total = len(paths)
+            for i, path in enumerate(paths, 1):
+                if tctx.cancelled():
+                    raise RuntimeError("已取消")
+                tctx.progress(int(100 * (i - 1) / max(total, 1)),
+                              f"检查 {path}")
+                res = ssh.exec(f"test -d {shq(path)}", timeout=15)
+                if res.ok:
+                    ok_n += 1
+                    tctx.log(f"✓ 存在：{path}")
+                else:
+                    missing.append(path)
+                    tctx.log(f"✗ 不存在：{path}")
+            tctx.progress(100, f"校验完成（{ok_n}/{total} 存在）")
+            if missing:
+                tctx.log("缺失目录请在各服务器创建（mkdir -p）后重试，"
+                         "或修改挂载表路径：")
+                for path in missing:
+                    tctx.log(f"    mkdir -p {path}")
+            else:
+                tctx.log("✓ 全部挂载路径在各目标服务器上均存在")
+
+        self.panel.run_tasks(
+            [(s, fn) for s in servers],
+            f"批量校验挂载路径（{len(paths)} 个路径 × {len(servers)} 台）")
 
     def _on_bandwidth_toggled(self, checked: bool) -> None:
         self.mount_edit.setEnabled(checked and self._has_kv_mount())
@@ -786,6 +1086,8 @@ class BatchPage(QWidget):
     def _build_stages(self) -> BatchStages:
         return BatchStages(
             distribute_image=self.stage_image_check.isChecked(),
+            # 「创建容器并配置UCM文件」开关勾选 = 创建容器阶段开启
+            # （创建容器后即写入 UCM 配置，两步合一）
             create_container=self.stage_container_check.isChecked(),
             run_precheck=self.stage_precheck_check.isChecked())
 
@@ -823,10 +1125,11 @@ class BatchPage(QWidget):
                              if self._selected_source() else ""),
                 source_port=(self._selected_source().port
                              if self._selected_source() else 22),
-                skip_existing=self.skip_existing_check.isChecked(),
+                target_tar_dir=self.tar_remote_edit.text().strip() or "/tmp",
                 recreate_container=self.recreate_check.isChecked(),
                 servers=servers,
                 container=self._build_container_template(),
+                ucm_config=self._build_ucm_cfg_template(),
                 precheck=self._build_precheck_template(),
                 stages=self._build_stages())
         except Exception as exc:
@@ -880,7 +1183,7 @@ class BatchPage(QWidget):
         """把模板内容回填到界面。"""
         self.mode_combo.setCurrentIndex(1 if tpl.image_mode == "pull" else 0)
         self.image_ref_edit.setText(tpl.image_ref)
-        self.skip_existing_check.setChecked(tpl.skip_existing)
+        self.tar_remote_edit.setText(tpl.target_tar_dir)
         self.recreate_check.setChecked(tpl.recreate_container)
 
         # 源服务器按 host:port 匹配
@@ -915,6 +1218,13 @@ class BatchPage(QWidget):
         if has_custom:
             self.custom_cmd_edit.setPlainText(cfg.custom_command)
 
+        ucm = tpl.ucm_config
+        # 是否写入随「创建容器并配置UCM文件」阶段开关（导入旧模板时
+        # ucm_config.enabled 仅作兼容，不再单独控制）
+        if ucm.content.strip():
+            self.ucm_cfg_view.setPlainText(ucm.content)
+        self.ucm_cfg_path_edit.setText(ucm.path)
+
         pre = tpl.precheck
         self.bandwidth_check.setChecked(pre.bandwidth_check)
         self.mount_edit.setText(pre.mount_path)
@@ -938,7 +1248,7 @@ class BatchPage(QWidget):
         servers = self._selected_targets()
         if not servers:
             QMessageBox.warning(self, "未选择目标服务器",
-                                "请在「2. 目标服务器」勾选至少一台目标服务器")
+                                "请在「1. 目标服务器」勾选至少一台目标服务器")
             return
         image_ref = self.image_ref_edit.text().strip()
         try:
@@ -955,24 +1265,42 @@ class BatchPage(QWidget):
                 "或取消勾选改用自动生成")
             return
 
-        mode = "pull" if self.mode_combo.currentIndex() == 1 else "tar"
-        source = None
-        if mode == "tar":
-            source = self._selected_source()
-            if source is None:
-                QMessageBox.warning(self, "参数错误", "镜像包中转方式需要选择源服务器")
-                return
-
         stages = self._build_stages()
         if not (stages.distribute_image or stages.create_container
                 or stages.run_precheck):
             QMessageBox.warning(self, "参数错误", "请至少勾选一个执行阶段")
             return
+
+        # 分发参数只在确实要分发镜像时校验；不分发时镜像须已在目标
+        # 服务器（镜像名仍在「镜像与分发」页签填写，用于创建容器/预检）
+        mode = ("tar", "pull", "direct")[self.mode_combo.currentIndex()]
+        source = None
+        if stages.distribute_image and mode in ("tar", "direct"):
+            source = self._selected_source()
+            if source is None:
+                QMessageBox.warning(
+                    self, "参数错误",
+                    f"{('镜像包中转' if mode == 'tar' else '服务器直传')}方式需要选择源服务器")
+                return
+            remote_dir = self.tar_remote_edit.text().strip() or "/tmp"
+            if not remote_dir.startswith("/"):
+                QMessageBox.warning(
+                    self, "参数错误",
+                    f"目标保存路径必须是绝对路径（以 / 开头）: {remote_dir}")
+                return
+
         try:
             container_tpl = self._build_container_template()
+            ucm_tpl = self._build_ucm_cfg_template()
             precheck_tpl = self._build_precheck_template()
         except BatchDeployError as exc:
             QMessageBox.warning(self, "参数错误", str(exc))
+            return
+        if ucm_tpl.enabled and not stages.create_container:
+            QMessageBox.warning(
+                self, "参数错误",
+                "「写入 UCM 配置文件」依赖容器创建阶段："
+                "请勾选右上角「创建容器」阶段开关，或取消勾选写入开关")
             return
 
         # 重置共享状态
@@ -980,54 +1308,72 @@ class BatchPage(QWidget):
         self._cleanup_local_tar()
         self._tar_ready = threading.Event()
         self._tar_error = ""
+        self._src_tar = ""
+        # 直传模式：源任务等待全部目标结束后清理源端镜像包（计数器而非
+        # Event——面板要等所有任务结束才触发 on_finished，等它会死锁）
+        self._targets_pending = len(servers)
+        self._targets_lock = threading.Lock()
 
         tasks: List[Tuple[ServerInfo, object]] = []
-        # 源服务器只在「镜像包中转 + 需要分发」时才参与（docker save 很耗时；
-        # 只创建容器/预检时无需准备镜像包，否则源服务器进度长期卡住）
-        if mode == "tar" and stages.distribute_image:
-            tasks.append((source, self._make_prepare_task(source, image_ref)))
+        # tar/直传模式下源服务器先准备镜像包（docker save 很耗时；只创建
+        # 容器/预检时无需准备，否则源服务器进度长期卡住）
+        if mode in ("tar", "direct") and stages.distribute_image:
+            tasks.append((source, self._make_prepare_task(
+                source, image_ref, mode)))
         for server in servers:
             tasks.append((server, self._make_deploy_task(
-                server, image_ref, mode, stages, container_tpl, precheck_tpl)))
+                server, image_ref, mode, source, stages, container_tpl,
+                ucm_tpl, precheck_tpl)))
 
         self.run_btn.setEnabled(False)
         title = (f"批量部署（{len(servers)} 台目标"
-                 + ("，源服务器先准备镜像包" if mode == "tar"
+                 + ("，源服务器先准备镜像包" if mode in ("tar", "direct")
                     and stages.distribute_image else "")
                  + "）")
         if not self.panel.run_tasks(tasks, title, on_finished=self._on_finished):
             self.run_btn.setEnabled(True)
             self._cleanup_local_tar()
 
-    def _make_prepare_task(self, source: ServerInfo, image_ref: str):
-        """源服务器任务：docker save 导出并下载镜像包到本机。"""
+    def _make_prepare_task(self, source: ServerInfo, image_ref: str,
+                           mode: str):
+        """源服务器任务：docker save 导出镜像包。
+
+        - tar：导出后下载到本机中转，删除源端临时包；
+        - direct：导出后等待各目标 scp 拉取完成，最后清理源端包。
+        """
         uid = uuid.uuid4().hex[:8]
-        local = os.path.join(tempfile.gettempdir(), f"ucm-batch-{uid}.tar.gz")
-        remote = f"/tmp/ucm-batch-{uid}.tar.gz"
-        self._local_tar = local
+        remote = f"/tmp/ucm-batch-{uid}.tar"
+        local = os.path.join(tempfile.gettempdir(), f"ucm-batch-{uid}.tar")
+        if mode == "tar":
+            self._local_tar = local
+        else:
+            self._src_tar = remote
 
         def fn(ssh, tctx):
             try:
                 tctx.progress(5, "docker save 导出镜像（可能需要数分钟）...")
                 export_image_tar(ssh, DockerManager(ssh), image_ref, remote,
                                  log=tctx.log, cancelled=tctx.cancelled)
-                tctx.progress(50, "下载镜像包到本机...")
-                size = ssh.file_size(remote)
-                tctx.log(f"镜像包大小: {size / 1e6:.1f} MB")
+                if mode == "direct":
+                    tctx.progress(100, "镜像包已导出（等待各目标服务器拉取）")
+                else:
+                    tctx.progress(50, "下载镜像包到本机...")
+                    size = ssh.file_size(remote)
+                    tctx.log(f"镜像包大小: {size / 1e6:.1f} MB")
 
-                def cb(sent: int, total: int) -> None:
-                    tctx.progress(
-                        int(50 + 45 * sent / max(total, 1)),
-                        f"下载镜像包 {sent / 1e6:.0f}/{total / 1e6:.0f} MB")
+                    def cb(sent: int, total: int) -> None:
+                        tctx.progress(
+                            int(50 + 45 * sent / max(total, 1)),
+                            f"下载镜像包 {sent / 1e6:.0f}/{total / 1e6:.0f} MB")
 
-                try:
-                    ssh.download_file(remote, local, progress_cb=cb)
-                finally:
                     try:
-                        ssh.exec(f"rm -f {shq(remote)}", timeout=60)
-                    except Exception:
-                        pass
-                tctx.progress(100, "镜像包准备完成（等待目标分发）")
+                        ssh.download_file(remote, local, progress_cb=cb)
+                    finally:
+                        try:
+                            ssh.exec(f"rm -f {shq(remote)}", timeout=60)
+                        except Exception:
+                            pass
+                    tctx.progress(100, "镜像包准备完成（等待目标分发）")
             except Exception as exc:
                 self._tar_error = str(exc)
                 self._tar_ready.set()
@@ -1035,15 +1381,34 @@ class BatchPage(QWidget):
             else:
                 self._tar_ready.set()
 
+            if mode == "direct":
+                # 等待全部目标流水线结束（成功/失败均会计数），随后清理源端包
+                while True:
+                    with self._targets_lock:
+                        if self._targets_pending <= 0:
+                            break
+                    if tctx.cancelled():
+                        return
+                    time.sleep(0.2)
+                if self._tar_error:
+                    return          # 源包可能仍需要人工排查，不自动删除
+                try:
+                    tctx.log(f"$ rm -f {remote}（清理源端镜像包）")
+                    ssh.exec(f"rm -f {shq(remote)}", timeout=60)
+                except Exception:
+                    tctx.log(f"源端镜像包清理失败，请手动删除: {remote}")
+
         return fn
 
     def _make_deploy_task(self, server: ServerInfo, image_ref: str, mode: str,
-                          stages: BatchStages, container_tpl: BatchContainerConfig,
+                          source: Optional[ServerInfo], stages: BatchStages,
+                          container_tpl: BatchContainerConfig,
+                          ucm_tpl: BatchUcmConfigConfig,
                           precheck_tpl: BatchPrecheckConfig):
         """一台目标服务器的流水线任务：分发 -> 创建容器 -> 预检。"""
         ranges = stage_progress_ranges(stages)
-        skip_existing = self.skip_existing_check.isChecked()
         recreate = self.recreate_check.isChecked()
+        remote_dir = self.tar_remote_edit.text().strip() or "/tmp"
         report = BatchTargetReport(server_id=server.id,
                                    server_name=server.name, image=image_ref)
 
@@ -1056,10 +1421,15 @@ class BatchPage(QWidget):
             docker = DockerManager(ssh)
 
             try:
-                # ---- 阶段1：镜像分发
+                # ---- 阶段1：镜像分发（目标已有同名镜像时自动跳过并在日志说明：
+                #      分发目标就是让镜像就位，已存在即视为分发成功）
                 if stages.distribute_image:
                     stage_progress("image", 2, "准备镜像...")
-                    if mode == "pull":
+                    if self._image_exists_on(ssh, image_ref):
+                        report.image_skipped = True
+                        tctx.log(f"目标已存在镜像 {image_ref}，跳过分发")
+                        stage_progress("image", 100, "镜像已存在，跳过分发")
+                    elif mode == "pull":
                         pull_image_on_target(
                             docker, image_ref,
                             progress=lambda p, m: stage_progress("image", p, m),
@@ -1073,15 +1443,23 @@ class BatchPage(QWidget):
                         if self._tar_error:
                             raise BatchDeployError(
                                 f"源服务器镜像包准备失败: {self._tar_error}")
-                        if skip_existing and docker.image_exists(image_ref):
-                            report.image_skipped = True
-                            tctx.log(f"镜像 {image_ref} 已存在，跳过分发")
-                            stage_progress("image", 100, "镜像已存在，跳过分发")
+                        if mode == "direct":
+                            dst = (remote_dir.rstrip("/") + "/"
+                                   + os.path.basename(self._src_tar))
+                            scp_image_between(
+                                ssh, source, self._src_tar, dst,
+                                progress=lambda p, m: stage_progress("image", p, m),
+                                log=tctx.log, cancelled=tctx.cancelled)
+                            load_remote_tar(
+                                ssh, docker, dst, image_ref,
+                                progress=lambda p, m: stage_progress("image", p, m),
+                                log=tctx.log)
                         else:
                             load_image_tar(
                                 ssh, docker, self._local_tar, image_ref,
                                 progress=lambda p, m: stage_progress("image", p, m),
-                                log=tctx.log, cancelled=tctx.cancelled)
+                                log=tctx.log, cancelled=tctx.cancelled,
+                                remote_dir=remote_dir)
 
                 # ---- 阶段2：容器创建
                 if stages.create_container:
@@ -1091,6 +1469,12 @@ class BatchPage(QWidget):
                         log=tctx.log, recreate=recreate,
                         cancelled=tctx.cancelled)
                     report.container = name
+                    # 容器创建完成后按「UCM文件配置」页签写入配置文件
+                    # （进度归入容器创建阶段尾部；失败则该台部署失败）
+                    write_ucm_config_on_target(
+                        ssh, ucm_tpl, report.container or container_tpl.name,
+                        progress=lambda p, m: stage_progress("container", p, m),
+                        log=tctx.log)
 
                 # ---- 阶段3：环境预检
                 if stages.run_precheck:
@@ -1108,6 +1492,8 @@ class BatchPage(QWidget):
                 report.error = str(exc)
                 self._reports[server.id] = report
                 tctx.log(f"[deployer] ✗ 执行失败: {exc}")
+                with self._targets_lock:
+                    self._targets_pending -= 1
                 if "取消" in str(exc):
                     raise
                 raise BatchDeployError(
@@ -1115,6 +1501,8 @@ class BatchPage(QWidget):
 
             self._reports[server.id] = report
             tctx.progress(100, report.describe())
+            with self._targets_lock:
+                self._targets_pending -= 1
 
         return fn
 

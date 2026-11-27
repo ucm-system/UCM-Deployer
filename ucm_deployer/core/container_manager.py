@@ -342,3 +342,79 @@ def ensure_container_removed(ssh: SSHClient, docker: DockerManager,
             raise DockerError(
                 f"删除旧容器 {name} 失败，请手动删除后重试"
                 + (f"（{detail}）" if detail else ""))
+
+
+class UcmConfigError(Exception):
+    """UCM 配置文件写入容器失败。"""
+
+
+# UCM 参数配置文件参考默认模板（参数请按实际存储环境修改）
+UCM_CONFIG_TEMPLATE = (
+    "ucm_connectors:\n"
+    "  - ucm_connector_name: \"UcmPipelineStore\"\n"
+    "    ucm_connector_config:\n"
+    "      store_pipeline: \"Cache|Posix\"\n"
+    "      storage_backends: \"/mnt/test\"\n"
+    "      posix_capacity_gb: 10240\n"
+    "      posix_io_engine: \"psync\"\n"
+    "      posix_data_trans_concurrency: 128\n"
+)
+
+# UCM 配置文件在容器内的默认保存路径（与拉起命令模板保持一致）
+UCM_CONFIG_DEFAULT_PATH = "/workspace/ucm_config_example.yaml"
+
+
+def write_ucm_config_file(ssh: SSHClient, container: str, path: str,
+                          content: str,
+                          log: Optional[Callable[[str], None]] = None,
+                          cancelled: Optional[Callable[[], bool]] = None,
+                          tmp_dir: str = "/tmp") -> None:
+    """把 UCM 配置文件（yaml 文本）写入目标容器（步骤3 与批量部署共用）。
+
+    流程：SFTP 上传宿主机临时文件 → 容器内 mkdir -p → docker cp →
+    读取文件开头校验 → 删除宿主机临时文件（finally 保证清理）。
+    失败抛 UcmConfigError；cancelled 回调在长命令前检查。
+    """
+    log = log or (lambda line: None)
+    container = (container or "").strip()
+    path = (path or "").strip()
+    if not container:
+        raise UcmConfigError("目标容器名为空")
+    if not path:
+        raise UcmConfigError("容器内配置文件路径为空")
+    if not content.strip():
+        raise UcmConfigError("配置内容为空")
+
+    import uuid as _uuid
+
+    tmp = f"{tmp_dir.rstrip('/')}/.ucm-cfg-{_uuid.uuid4().hex[:8]}.yaml"
+    log(f"写入 UCM 配置文件 → 容器 {container}：{path}")
+    try:
+        ssh.write_file(tmp, content)
+        log(f"已上传宿主机临时文件 {tmp}")
+        d = path.rsplit("/", 1)[0] if "/" in path else "."
+        res = ssh.exec(f"docker exec {shq(container)} mkdir -p {shq(d)}",
+                       timeout=30)
+        if not res.ok:
+            raise UcmConfigError(
+                f"容器内创建目录失败：{(res.stderr or res.stdout).strip()[:200]}")
+        res = ssh.exec(
+            f"docker cp {shq(tmp)} {shq(container)}:{shq(path)}",
+            timeout=60)
+        if not res.ok:
+            raise UcmConfigError(
+                f"docker cp 失败：{(res.stderr or res.stdout).strip()[:200]}")
+        log("已拷贝进容器")
+        if cancelled is not None and cancelled():
+            raise UcmConfigError("已取消")
+        check = ssh.exec(
+            f"docker exec {shq(container)} head -5 {shq(path)}",
+            timeout=30)
+        if check.ok:
+            log("容器内文件开头：\n" + (check.stdout or "").rstrip())
+        else:
+            raise UcmConfigError(
+                "写入后校验失败（容器内读取文件出错）："
+                f"{(check.stderr or check.stdout).strip()[:200]}")
+    finally:
+        ssh.exec(f"rm -f {shq(tmp)}", timeout=30)

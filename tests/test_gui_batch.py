@@ -113,11 +113,11 @@ def test_main_window_has_batch_step(qapp):
     win = MainWindow()
     win.show()
     qapp.processEvents()
-    win.goto_step(5)
+    win.goto_step(4)
     qapp.processEvents()
-    assert win.current_step() == 5
+    assert win.current_step() == 4
     assert win.batch_page is not None
-    assert "批量部署" in win._nav_buttons[5].text()
+    assert "批量部署" in win._nav_buttons[4].text()
     win.close()
 
 
@@ -133,8 +133,9 @@ def test_batch_page_fits_one_screen(qapp, tmp_path):
     page = win.batch_page
     available = win.centralWidget().height()
     # 挂载表加高后允许页面轻微滚动（QScrollArea 包装），只约束不要高得离谱
-    # +175：自定义命令 checkbox 单行常驻的代价（其余编辑区勾选才展开）
-    assert page.minimumSizeHint().height() <= available + 175, \
+    # +180：自定义命令 checkbox 单行常驻 + 镜像来源表单「目标保存路径」行
+    #（其余编辑区勾选才展开）
+    assert page.minimumSizeHint().height() <= available + 180, \
         f"步骤5 最小高度 {page.minimumSizeHint().height()}px 超过可用 {available}px 太多"
     assert page.panel.height() >= 100
     assert page.mount_table.minimumHeight() >= 150, "挂载表应有足够高度展示多行（含空行留白）"
@@ -237,9 +238,9 @@ def test_batch_page_template_export_import_roundtrip(qapp, tmp_path, monkeypatch
 
     # 填充各配置
     page.image_ref_edit.setText("ucm-vllm:0.4.0")
-    page.skip_existing_check.setChecked(False)
     page.recreate_check.setChecked(True)
     page.name_edit.setText("ucm-batch")
+    page.tar_remote_edit.setText("/data/imgs")
     page.shm_edit.setText("256g")
     # 统一挂载表：KV Cache 两行 + 模型一行 + 自定义一行（默认空表，逐行添加）
     page.mount_type.setCurrentIndex(0)              # KV Cache
@@ -276,7 +277,7 @@ def test_batch_page_template_export_import_roundtrip(qapp, tmp_path, monkeypatch
     qapp.processEvents()
 
     assert page2.image_ref_edit.text() == "ucm-vllm:0.4.0"
-    assert page2.skip_existing_check.isChecked() is False
+    assert page2.tar_remote_edit.text() == "/data/imgs"
     assert page2.recreate_check.isChecked() is True
     assert page2.name_edit.text() == "ucm-batch"
     assert page2.shm_edit.text() == "256g"
@@ -391,6 +392,48 @@ def _script_common(fake_ssh):
     fake_ssh.add_default(r"ucm-toolkit run precheck", stdout=_PRECHECK_OUT)
 
 
+def test_batch_page_ucm_config_write(qapp, tmp_path, fake_ssh):
+    """「UCM文件配置」页签：勾选后容器创建完成即写入各目标容器。"""
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 1)
+    page.refresh_servers()
+    check_target(page, servers[0], qapp)
+
+    fake_ssh.add_default(r"^docker pull", stdout="Status: Downloaded\n")
+    fake_ssh.add_default(r"docker image inspect", stdout="")
+    # 目标侧存在性检查（--format 形式）：无同名镜像 -> 执行 pull
+    fake_ssh.add_default(r"docker image inspect --format", exit_code=1)
+    _script_common(fake_ssh)
+    # UCM 配置写入链：mkdir -> docker cp -> head 校验 -> rm 临时文件
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n  custom: 1\n")
+    fake_ssh.add_default(r"^rm -f /tmp/\.ucm-cfg-", stdout="")
+
+    page.mode_combo.setCurrentIndex(1)      # 镜像仓库拉取
+    page.image_ref_edit.setText("quay.io/x/ucm-vllm:0.4.0")
+    page.ucm_cfg_view.setPlainText("ucm_connectors:\n  custom: 1\n")
+    page.ucm_cfg_path_edit.setText("/workspace/ucm_config_example.yaml")
+    page._run()
+    assert _wait_panel(page.panel, qapp)
+
+    rep = page._reports[servers[0].id]
+    assert rep.container == "ucm-vllm"
+    cmds = [c.executed_command for c in fake_ssh.instances[0].channels]
+    cp = [c for c in cmds if c.startswith("docker cp /tmp/.ucm-cfg-")]
+    assert len(cp) == 1
+    assert "ucm-vllm:/workspace/ucm_config_example.yaml" in cp[0]
+    assert any("head -5 /workspace/ucm_config_example.yaml" in c for c in cmds)
+    # 上传内容 = 页签编辑框内容
+    up = {k: v for k, v in fake_ssh.instances[0].files.items()
+          if k.startswith("/tmp/.ucm-cfg-")}
+    assert list(up.values()) == [b"ucm_connectors:\n  custom: 1\n"]
+    # 执行说明包含合并后的阶段名（「创建容器并配置UCM文件」默认勾选）
+    assert "创建容器并配置UCM文件" in page.exec_summary_label.text()
+    assert "写入UCM配置" not in page.exec_summary_label.text()
+
+
 def test_batch_page_run_pull_mode_two_targets(qapp, tmp_path, fake_ssh):
     page = make_page(qapp, tmp_path)
     servers = add_servers(page.ctx, 2)
@@ -400,7 +443,15 @@ def test_batch_page_run_pull_mode_two_targets(qapp, tmp_path, fake_ssh):
 
     fake_ssh.add_default(r"^docker pull", stdout="Status: Downloaded\n")
     fake_ssh.add_default(r"docker image inspect", stdout="")
+    # 目标侧存在性检查（--format 形式）：无同名镜像 -> 执行 pull
+    fake_ssh.add_default(r"docker image inspect --format", exit_code=1)
     _script_common(fake_ssh)
+    # UCM 配置写入链（勾选「创建容器并配置 UCM 文件」后每台执行）
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n")
+    fake_ssh.add_default(r"^rm -f /tmp/\.ucm-cfg-", stdout="")
 
     page.mode_combo.setCurrentIndex(1)      # 镜像仓库拉取
     page.image_ref_edit.setText("quay.io/x/ucm-vllm:0.4.0")
@@ -408,7 +459,7 @@ def test_batch_page_run_pull_mode_two_targets(qapp, tmp_path, fake_ssh):
     assert page.panel.is_running()
     assert _wait_panel(page.panel, qapp)
 
-    # 两台各自完成 pull + docker run + 预检
+    # 两台各自完成 pull + docker run + UCM 配置写入 + 预检
     assert set(page._reports) == {s.id for s in servers}
     for rep in page._reports.values():
         assert rep.container == "ucm-vllm"
@@ -435,17 +486,23 @@ def test_batch_page_run_tar_mode_with_source_row(qapp, tmp_path, fake_ssh):
     check_target(page, servers[1], qapp)
 
     fake_ssh.add_default(r"docker image inspect", stdout="")
+    # 目标侧存在性检查（--format 形式）：无同名镜像 -> 走上传/导入路径
+    fake_ssh.add_default(r"docker image inspect --format", exit_code=1)
     fake_ssh.add_default(r"bash -c", stdout="")            # docker save 导出
     fake_ssh.add_default(r"test -s", stdout="")            # 导出文件非空校验
     fake_ssh.add_default(r"rm -f", stdout="")
     fake_ssh.add_default(r"^docker load", stdout="Loaded image: ucm-vllm:0.4.0\n")
     _script_common(fake_ssh)
+    # UCM 配置写入链（勾选「创建容器并配置 UCM 文件」后执行）
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n")
 
     # 源服务器选择第一台
     index = page._source_index_of(servers[0].id)
     page.source_combo.setCurrentIndex(index)
     page.image_ref_edit.setText("ucm-vllm:0.4.0")
-    page.skip_existing_check.setChecked(False)             # 强制走上传/导入路径
     page._run()
     assert page.panel.is_running()
     assert _wait_panel(page.panel, qapp)
@@ -458,11 +515,59 @@ def test_batch_page_run_tar_mode_with_source_row(qapp, tmp_path, fake_ssh):
     cmds = []
     for client in fake_ssh.instances:
         cmds.extend(c.executed_command for c in client.channels)
-    assert any("docker save" in c and "gzip -1" in c for c in cmds)
+    assert any("docker save -o" in c for c in cmds)
     assert any(c.startswith("docker load -i /tmp/ucm-batch-") for c in cmds)
     assert any(c.startswith("docker run -itd") for c in cmds)
     # 镜像包在本机临时目录（执行完成后已清理）
     assert page._local_tar == ""
+
+
+def test_batch_page_run_direct_mode(qapp, tmp_path, fake_ssh):
+    """服务器直传模式：源服务器 save 导出 → 目标 scp 拉取（sshpass）→
+    docker load；全部结束后源端镜像包被清理。"""
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 2)      # 0=源，1=目标
+    page.refresh_servers()
+    check_target(page, servers[1], qapp)
+
+    fake_ssh.add_default(r"docker image inspect", stdout="")
+    # 目标侧存在性检查（--format 形式）：无同名镜像 -> 走 scp/导入路径
+    fake_ssh.add_default(r"docker image inspect --format", exit_code=1)
+    fake_ssh.add_default(r"bash -c", stdout="")            # docker save 导出
+    fake_ssh.add_default(r"test -s", stdout="")            # 导出文件非空校验
+    fake_ssh.add_default(r"^which sshpass", stdout="/usr/bin/sshpass\n")
+    fake_ssh.add_default(r"^sshpass", stdout="")           # scp 拉取
+    fake_ssh.add_default(r"rm -f", stdout="")
+    fake_ssh.add_default(r"^docker load", stdout="Loaded image: ucm-vllm:0.4.0\n")
+    _script_common(fake_ssh)
+    # UCM 配置写入链（「创建容器并配置UCM文件」默认勾选）
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n")
+
+    page.mode_combo.setCurrentIndex(2)                     # 服务器直传
+    index = page._source_index_of(servers[0].id)
+    page.source_combo.setCurrentIndex(index)
+    page.image_ref_edit.setText("ucm-vllm:0.4.0")
+    page.tar_remote_edit.setText("/data/imgs")
+    page._run()
+    assert page.panel.is_running()
+    assert _wait_panel(page.panel, qapp)
+
+    assert page.panel.table.rowCount() == 2                # 源 + 目标
+    assert page._reports[servers[1].id].precheck_verdict == "passed"
+    cmds = []
+    for client in fake_ssh.instances:
+        cmds.extend(c.executed_command for c in client.channels)
+    assert any("docker save -o" in c for c in cmds)
+    scp_cmds = [c for c in cmds if c.startswith("sshpass")]
+    assert len(scp_cmds) == 1
+    assert "-P 22" in scp_cmds[0] and "/data/imgs/" in scp_cmds[0]
+    assert any(c.startswith("docker load -i /data/imgs/ucm-batch-")
+               for c in cmds)
+    # 全部结束后源端镜像包被清理（源任务等待目标计数归零后执行）
+    assert page._targets_pending <= 0
 
 
 def test_batch_page_run_tar_source_also_target(qapp, tmp_path, fake_ssh):
@@ -474,10 +579,17 @@ def test_batch_page_run_tar_source_also_target(qapp, tmp_path, fake_ssh):
     check_target(page, servers[1], qapp)
 
     fake_ssh.add_default(r"docker image inspect", stdout="")
+    # 目标侧存在性检查（--format 形式）：镜像已存在 -> 跳过分发
+    fake_ssh.add_default(r"docker image inspect --format", exit_code=0)
     fake_ssh.add_default(r"bash -c", stdout="")
     fake_ssh.add_default(r"test -s", stdout="")
     fake_ssh.add_default(r"rm -f", stdout="")
     _script_common(fake_ssh)
+    # UCM 配置写入链（勾选「创建容器并配置 UCM 文件」后每台执行）
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n")
 
     index = page._source_index_of(servers[0].id)
     page.source_combo.setCurrentIndex(index)
@@ -488,11 +600,10 @@ def test_batch_page_run_tar_source_also_target(qapp, tmp_path, fake_ssh):
     # 源服务器两行（准备镜像包 + 自身部署），互不覆盖
     assert page.panel.table.rowCount() == 3
     assert set(page._reports) == {s.id for s in servers}
-    # 源服务器自身跳过镜像分发（镜像已在本机）
+    # 两台目标的镜像均已存在 -> 自动跳过分发（容器/预检照常执行）
     assert page._reports[servers[0].id].image_skipped is True
     assert page._reports[servers[0].id].container == "ucm-vllm"
     assert page._reports[servers[0].id].precheck_verdict == "passed"
-    # 目标 1 未跳过（执行了上传/导入路径？此处 image inspect 恒成功 -> 跳过）
     assert page._reports[servers[1].id].image_skipped is True
 
 
@@ -505,6 +616,8 @@ def test_batch_page_run_stage_subset_only_image(qapp, tmp_path, fake_ssh):
 
     fake_ssh.add_default(r"^docker pull", stdout="Status: Downloaded\n")
     fake_ssh.add_default(r"docker image inspect", stdout="")
+    # 目标侧存在性检查（--format 形式）：无同名镜像 -> 执行 pull
+    fake_ssh.add_default(r"docker image inspect --format", exit_code=1)
 
     page.mode_combo.setCurrentIndex(1)
     page.image_ref_edit.setText("quay.io/x/ucm-vllm:0.4.0")
@@ -544,6 +657,12 @@ def test_batch_page_custom_command_mode(qapp, tmp_path, fake_ssh):
     fake_ssh.add_default(r"docker run --rm", stdout="uc-manager==1.2.3\n")
     fake_ssh.add_default(r"docker ps", stdout="")
     fake_ssh.add_default(r"^docker run -itd", stdout="container-id\n")
+    # UCM 配置写入链（勾选「创建容器并配置 UCM 文件」后执行）
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n")
+    fake_ssh.add_default(r"^rm -f /tmp/\.ucm-cfg-", stdout="")
 
     page.image_ref_edit.setText("ucm-vllm:0.4.0")
     page.stage_image_check.setChecked(False)
@@ -581,6 +700,12 @@ def test_batch_page_run_container_precheck_no_source_task(qapp, tmp_path, fake_s
                          stdout="/usr/local/Ascend/driver\n")
     fake_ssh.add_default(r"^docker run -itd", stdout="container-id\n")
     fake_ssh.add_default(r"ucm-toolkit run precheck", stdout=_PRECHECK_OUT)
+    # UCM 配置写入链（「创建容器并配置 UCM 文件」默认模板内容）
+    fake_ssh.add_default(r"docker exec .* mkdir -p", stdout="")
+    fake_ssh.add_default(r"^docker cp", stdout="")
+    fake_ssh.add_default(r"docker exec .* head -5",
+                         stdout="ucm_connectors:\n")
+    fake_ssh.add_default(r"^rm -f /tmp/\.ucm-cfg-", stdout="")
 
     page.image_ref_edit.setText("ucm-vllm:0.4.0")
     page.stage_image_check.setChecked(False)
@@ -712,3 +837,174 @@ def test_bandwidth_kv_mount_from_template(qapp, tmp_path):
     assert not bp2.bandwidth_check.isEnabled()
     assert not bp2.bandwidth_check.isChecked()
     assert not bp2.mount_edit.isEnabled()
+
+
+def test_exec_summary_updates(qapp, tmp_path):
+    """模块3 动态说明：随阶段开关与目标勾选实时刷新。"""
+    from ucm_deployer.gui.widgets.batch_page import BatchPage
+
+    bp = BatchPage(make_ctx(tmp_path))
+    servers = add_servers(bp.ctx, 2)
+    bp.refresh_servers()
+    # 默认全阶段（「创建容器并配置UCM文件」默认勾选）+ 未选目标
+    assert bp.exec_summary_label.text() == (
+        "已选阶段：分发镜像 → 创建容器并配置UCM文件 → 环境预检"
+        "（请先勾选目标服务器）")
+    check_target(bp, servers[0], qapp)
+    assert bp.exec_summary_label.text() == (
+        "将对 1 台目标执行：分发镜像 → 创建容器并配置UCM文件 → 环境预检")
+    # 取消各阶段 -> 文案与剩余阶段同步
+    bp.stage_image_check.setChecked(False)
+    assert bp.exec_summary_label.text() == (
+        "将对 1 台目标执行：创建容器并配置UCM文件 → 环境预检")
+    bp.stage_container_check.setChecked(False)
+    assert bp.exec_summary_label.text() == "将对 1 台目标执行：环境预检"
+    bp.stage_precheck_check.setChecked(False)
+    assert bp.exec_summary_label.text() == (
+        "未勾选任何执行阶段（勾选模块2 右上角的阶段开关）")
+    # 页签随勾选置灰/恢复（1=容器配置、3=预检配置；2=UCM文件配置随
+    # 「创建容器并配置UCM文件」开关联动）；
+    # 0=镜像与分发页签保持可编辑（镜像名始终要填），只禁用分发参数区
+    bp.stage_precheck_check.setChecked(False)
+    assert not bp.config_tabs.isTabEnabled(3)
+    bp.stage_image_check.setChecked(False)
+    assert bp.config_tabs.isTabEnabled(0)
+    assert not bp._distribute_widget.isEnabled()
+    assert bp.image_ref_edit.isEnabled()
+    assert "已存在于各目标服务器" in bp._source_hint.text()
+    # 「创建容器并配置UCM文件」勾选 -> 容器配置/UCM文件配置可选中
+    bp.stage_container_check.setChecked(True)
+    assert bp.config_tabs.isTabEnabled(1)
+    assert bp.config_tabs.isTabEnabled(2)
+    bp.stage_image_check.setChecked(True)
+    assert bp._distribute_widget.isEnabled()
+    assert bp._source_hint.text() == ""
+    bp.stage_precheck_check.setChecked(True)
+    assert bp.config_tabs.isTabEnabled(3)
+    # 取消「创建容器并配置UCM文件」-> 两页签不可选中、阶段不执行
+    bp.stage_container_check.setChecked(False)
+    assert not bp.config_tabs.isTabEnabled(1)
+    assert not bp.config_tabs.isTabEnabled(2)
+    assert not bp._build_stages().create_container
+    bp.stage_container_check.setChecked(True)
+    assert bp.config_tabs.isTabEnabled(1)
+    assert bp.config_tabs.isTabEnabled(2)
+    assert bp._build_stages().create_container
+
+
+def test_target_table_select_interactions(qapp, tmp_path):
+    """目标表格勾选交互：点行任意处切换勾选、点「部署」列表头全选/清空、
+    勾选行高亮、右键菜单接管全选/清空/刷新（列头为纯文本无三态标记）。"""
+    from PySide6.QtCore import Qt
+
+    from ucm_deployer.gui.widgets.batch_page import BatchPage
+
+    bp = BatchPage(make_ctx(tmp_path))
+    servers = add_servers(bp.ctx, 3)
+    bp.refresh_servers()
+    qapp.processEvents()
+    header_item = bp.target_table.horizontalHeaderItem(0)
+    assert header_item.text() == "部署"       # 列头为纯文本（无三态标记）
+
+    # 点行任意位置（第 1 列）= 勾选该台
+    bp.target_table.cellClicked.emit(0, 1)
+    qapp.processEvents()
+    assert bp._target_ids == {servers[0].id}
+    # 勾选行整行高亮
+    assert bp.target_table.item(0, 2).background().color().name().lower() \
+        in ("#eaf2ff", "#eaf2ff")
+
+    # 再点一次 = 取消（高亮清除，用空画刷而非黑色）
+    bp.target_table.cellClicked.emit(0, 1)
+    qapp.processEvents()
+    assert bp._target_ids == set()
+    assert bp.target_table.item(0, 2).background().style() == Qt.NoBrush
+
+    # 点列头 = 全选（当前未选 -> 取反为全选）
+    bp.target_table.horizontalHeader().sectionClicked.emit(0)
+    qapp.processEvents()
+    assert bp._target_ids == {s.id for s in servers}
+    assert header_item.text() == "部署"       # 全选后列头仍为纯文本
+    # 再点列头 = 清空（已全选 -> 取反）
+    bp.target_table.horizontalHeader().sectionClicked.emit(0)
+    qapp.processEvents()
+    assert bp._target_ids == set()
+
+    # 点击非「部署」列表头不改变勾选
+    bp.target_table.cellClicked.emit(1, 1)
+    qapp.processEvents()
+    bp.target_table.horizontalHeader().sectionClicked.emit(2)
+    qapp.processEvents()
+    assert bp._target_ids == {servers[1].id}
+
+    # 右键菜单已接管全选/清空/刷新（上下文菜单策略）
+    from PySide6.QtCore import Qt as _Qt
+    assert bp.target_table.contextMenuPolicy() == _Qt.CustomContextMenu
+
+
+def test_custom_cmd_disables_extra_args(qapp, tmp_path):
+    """两种命令模式互斥的可见反馈：勾选自定义命令 -> 附加参数置灰；
+    预检配置同理：未勾选「使用自定义预检配置」时编辑框置灰。"""
+    from ucm_deployer.gui.widgets.batch_page import BatchPage
+
+    bp = BatchPage(make_ctx(tmp_path))
+    # 初始：附加参数可用，预检编辑框置灰（内容仍可见作参考）
+    assert bp.extra_args_edit.isEnabled()
+    assert bp.custom_cfg_edit.isEnabled() is False
+    assert bp.custom_cfg_edit.toPlainText() != ""
+    # 勾选自定义命令 -> 附加参数置灰
+    bp.custom_cmd_check.setChecked(True)
+    assert not bp.extra_args_edit.isEnabled()
+    assert bp.extra_args_edit.toolTip() != ""
+    bp.custom_cmd_check.setChecked(False)
+    assert bp.extra_args_edit.isEnabled()
+    assert bp.extra_args_edit.toolTip() == ""
+    # 勾选自定义预检配置 -> 编辑框启用
+    bp.custom_cfg_check.setChecked(True)
+    assert bp.custom_cfg_edit.isEnabled()
+    bp.custom_cfg_check.setChecked(False)
+    assert not bp.custom_cfg_edit.isEnabled()
+
+
+def test_batch_page_mount_verify(qapp, tmp_path, fake_ssh):
+    """批量校验挂载路径：对勾选目标并行 test -d，结果写入各日志页签。"""
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 2)
+    page.refresh_servers()
+    check_target(page, servers[0], qapp)
+    check_target(page, servers[1], qapp)
+    fake_ssh.add_default(r"^test -d /mnt/exists", stdout="")
+    fake_ssh.add_default(r"^test -d /mnt/missing", exit_code=1)
+    page.mount_host_edit.setText("/mnt/exists")
+    page._mount_add()
+    page.mount_host_edit.setText("/mnt/missing")
+    page._mount_add()
+    page._mount_verify()
+    assert page.panel.is_running()
+    assert _wait_panel(page.panel, qapp)
+    cmds = []
+    for client in fake_ssh.instances:
+        cmds.extend(c.executed_command for c in client.channels)
+    assert cmds.count("test -d /mnt/exists") == 2      # 2 台目标各查 1 次
+    assert cmds.count("test -d /mnt/missing") == 2
+    text = "\n".join(w.toPlainText()
+                     for w in page.panel._logs.values())
+    assert "✓ 存在：/mnt/exists" in text
+    assert "✗ 不存在：/mnt/missing" in text
+    assert "mkdir -p /mnt/missing" in text
+
+
+def test_batch_page_mount_verify_guards(qapp, tmp_path, fake_ssh):
+    """批量校验守卫：空挂载表 / 未勾选目标直接提示，不产生 SSH 命令。"""
+    page = make_page(qapp, tmp_path)
+    add_servers(page.ctx, 1)
+    page.refresh_servers()
+    page._mount_verify()          # 空挂载表 -> 提示
+    assert not page.panel.is_running()
+    page.mount_host_edit.setText("/mnt/kv1")
+    page._mount_add()
+    page._mount_verify()          # 未勾选目标 -> 提示
+    assert not page.panel.is_running()
+    for client in fake_ssh.instances:
+        assert not any(c.executed_command.startswith("test -d")
+                       for c in client.channels)
