@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
-"""步骤5：服务部署 —— 纯操作指引页。
+"""步骤5：推理服务部署 —— 拉起命令指引 + 自动验证页。
 
-页面分三个模块（阅读顺序 = 操作顺序）：
-1. UCM 配置文件：参考默认配置 + 参数说明官方网址（可点击），
-   需要按环境修改的参数以高亮显示；
-2. 推理服务拉起命令：容器内执行的命令模板，包含必需的环境变量导出
+页面分两个模块（阅读顺序 = 操作顺序）：
+1. 推理服务拉起命令：容器内执行的命令模板，包含必需的环境变量导出
    （ENABLE_UCM_PATCH / VLLM_CPU_AFFINITY）与 --kv-transfer-config
    接入 UCMConnector 的配置块；需要修改的占位（模型路径、UCM_CONFIG_FILE）
-   以高亮显示；
-3. 验证连通性：按输入的端口与模型名自动生成 curl 验证命令
-   （服务就绪后在宿主机另开终端执行）。
+   以高亮显示——UCM_CONFIG_FILE 路径与步骤3「UCM 文件配置」写入的
+   路径自动联动；
+2. 验证连通性：按输入的服务器 IP、端口与模型名自动生成 curl 命令
+   （可复制到宿主机另开终端执行），也可点击「执行连通性测试」由工具
+   通过 SSH 在目标服务器上自动执行并逐项判定。
 
-本页为静态指引（展示 + 可复制），不含任何执行按钮。
+UCM 配置文件的编辑与写入已在步骤3「UCM 文件配置」模块完成。
+唯一执行入口：连通性测试（通过任务面板后台执行）。
 """
 from __future__ import annotations
 
 import html as _html
+import json as _json
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -24,14 +26,17 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from ...core.container_manager import UCM_CONFIG_DEFAULT_PATH
 from ..state import AppContext
-from .common import attach_resize_grip
+from .common import ParallelTaskPanel, attach_resize_grip
 
 _MONO_FONT = "Consolas"
 
@@ -43,19 +48,10 @@ UCM_DOC_URL = ("https://support.huawei.com/enterprise/zh/doc/EDOC1100582752/"
                "b4b5937b?idPath=7919749%7C251366268%7C250389224%7C"
                "263153904%7C268354339")
 
-# 模块1：UCM 配置文件参考默认模板（参数请按实际存储环境修改）
-UCM_CONFIG_TEMPLATE = (
-    "ucm_connectors:\n"
-    "  - ucm_connector_name: \"UcmPipelineStore\"\n"
-    "    ucm_connector_config:\n"
-    "      store_pipeline: \"Cache|Posix\"\n"
-    "      storage_backends: \"/mnt/test\"\n"
-    "      posix_capacity_gb: 10240\n"
-    "      posix_io_engine: \"psync\"\n"
-    "      posix_data_trans_concurrency: 128\n"
-)
+# UCM 配置文件在容器内的默认保存路径（步骤3 写入；拉起命令模板引用）
+CFG_DEFAULT_PATH = UCM_CONFIG_DEFAULT_PATH
 
-# 模块2：推理服务拉起命令模板（容器内执行）
+# 模块1：推理服务拉起命令模板（容器内执行）
 START_CMD_TEMPLATE = (
     "# 拉起服务前先导出环境变量（UCM 补丁开关 + CPU 亲和）\n"
     "export ENABLE_UCM_PATCH=1\n"
@@ -69,22 +65,17 @@ START_CMD_TEMPLATE = (
     "        \"kv_connector_module_path\": \"ucm.integration.vllm.ucm_connector\",\n"
     "        \"kv_role\": \"kv_both\",\n"
     "        \"kv_connector_extra_config\": {\n"
-    "            \"UCM_CONFIG_FILE\": \"/workspace/ucm_config_example.yaml\"\n"
+    "            \"UCM_CONFIG_FILE\": \"" + CFG_DEFAULT_PATH + "\"\n"
     "        }\n"
     "    }'\n"
 )
 
-# 模块2 中需要按环境修改的片段（高亮显示）
+# 模块1 中需要按环境修改的片段（高亮显示；UCM_CONFIG_FILE 值随步骤3 写入路径联动）
 START_CMD_HIGHLIGHTS = (
-    "/workspace/ucm_config_example.yaml",
+    CFG_DEFAULT_PATH,
 )
 
-# 模块1 中需要按环境修改的片段（高亮显示）
-UCM_CONFIG_HIGHLIGHTS = (
-    '"/mnt/test"',
-)
-
-# 模块3：验证连通性命令模板（宿主机另开终端执行；端口/模型名动态替换）
+# 模块2：验证连通性命令模板（宿主机另开终端执行；端口/模型名动态替换）
 VERIFY_CMD_TEMPLATE = (
     "# 1. 服务健康检查\n"
     "curl --fail http://127.0.0.1:7800/health\n"
@@ -110,6 +101,7 @@ VERIFY_CMD_TEMPLATE = (
 )
 
 VERIFY_DEFAULT_PORT = "7800"
+VERIFY_DEFAULT_HOST = "127.0.0.1"
 VERIFY_DEFAULT_MODEL = "qwen3.8"
 
 
@@ -124,12 +116,15 @@ def _render_highlighted(template: str, highlights) -> str:
     return text
 
 
-def build_verify_command(port: str = "", model: str = "") -> str:
-    """按端口与模型名生成验证连通性命令；留空时保持模板默认占位值。"""
+def build_verify_command(host: str = "", port: str = "",
+                         model: str = "") -> str:
+    """按主机、端口与模型名生成验证连通性命令；留空时保持模板默认占位值。"""
+    host = (host or "").strip() or VERIFY_DEFAULT_HOST
     port = (port or "").strip() or VERIFY_DEFAULT_PORT
     model = (model or "").strip() or VERIFY_DEFAULT_MODEL
     return (VERIFY_CMD_TEMPLATE
-            .replace(VERIFY_DEFAULT_PORT, port)
+            .replace(f"http://{VERIFY_DEFAULT_HOST}:{VERIFY_DEFAULT_PORT}",
+                     f"http://{host}:{port}")
             .replace(f'"{VERIFY_DEFAULT_MODEL}"', f'"{model}"'))
 
 
@@ -174,50 +169,45 @@ class ServicePage(QWidget):
             attach_resize_grip(view)
             return view
 
-        # ---------- 1. UCM 配置文件
-        cfg_box = QGroupBox("1. UCM 配置文件")
-        lay1 = QVBoxLayout(cfg_box)
+        # ---------- 1. 推理服务拉起命令
+        cmd_box = QGroupBox("1. 推理服务拉起命令（在容器内执行）")
+        lay1 = QVBoxLayout(cmd_box)
         lay1.setSpacing(4)
-        cfg_hint = QLabel(
-            "UCM 配置文件参考默认配置如下，<b>高亮部分</b>（存储路径等）请按实际环境修改；"
-            "将配置保存为 yaml 文件（如 <code>/workspace/ucm_config_example.yaml</code>，"
-            "路径可自定义，需与拉起命令中 <code>UCM_CONFIG_FILE</code> 保持一致）；"
-            f"详细参数说明见 <a href=\"{UCM_DOC_URL}\">UCM 参数配置说明（华为官方文档）</a>")
-        cfg_hint.setTextFormat(Qt.RichText)
-        cfg_hint.setOpenExternalLinks(True)
-        cfg_hint.setWordWrap(True)
-        cfg_hint.setProperty("role", "hint")
-        self.cfg_view = _readonly_html_view(UCM_CONFIG_TEMPLATE,
-                                            UCM_CONFIG_HIGHLIGHTS,
-                                            fit_content=True)
-        lay1.addWidget(cfg_hint)
-        lay1.addWidget(self.cfg_view, 1)
-
-        # ---------- 2. 推理服务拉起命令
-        cmd_box = QGroupBox("2. 推理服务拉起命令（在容器内执行）")
-        lay2 = QVBoxLayout(cmd_box)
-        lay2.setSpacing(4)
         cmd_hint = QLabel(
             "注意事项：<br>"
             "① 拉起服务前需先导出环境变量：<code>export ENABLE_UCM_PATCH=1</code>、"
             "<code>export VLLM_CPU_AFFINITY=1</code>；<br>"
             "② 拉起命令后必须附加 <code>--kv-transfer-config</code>，通过 UCMConnector "
             "把 UCM 接入 vLLM；<br>"
-            "③ <b>高亮部分</b>需按实际环境修改：模型路径（<code>vllm serve</code> "
-            "参数）与 <code>UCM_CONFIG_FILE</code>（指向模块1 保存的 yaml，"
-            "两处路径必须一致）。")
+            "③ <b>PD 分离部署</b>时，<code>--kv-transfer-config</code> 只需在 "
+            "<b>Prefill 实例</b>的拉起命令中添加，<b>Decode 实例无需添加</b>；"
+            "单机 / 多机部署按原有方式（即下方模板）。<br>"
+            "④ <b>高亮部分</b>需按实际环境修改：模型路径（<code>vllm serve</code> "
+            "参数）与 <code>UCM_CONFIG_FILE</code>（指向步骤3「UCM 文件配置」"
+            f"写入的 yaml，写入成功后自动同步；"
+            "详细参数说明见步骤3 页内链接）。")
         cmd_hint.setTextFormat(Qt.RichText)
         cmd_hint.setWordWrap(True)
         cmd_hint.setProperty("role", "hint")
+        # 拉起命令模板：UCM_CONFIG_FILE 的值随步骤3「UCM 文件配置」写入路径联动
+        self._cmd_path = CFG_DEFAULT_PATH
         self.cmd_view = _readonly_html_view(START_CMD_TEMPLATE,
-                                            START_CMD_HIGHLIGHTS)
-        lay2.addWidget(cmd_hint)
-        lay2.addWidget(self.cmd_view, 1)
+                                            (self._cmd_path,))
+        lay1.addWidget(cmd_hint)
+        lay1.addWidget(self.cmd_view, 1)
 
-        # ---------- 3. 验证连通性（按输入自动生成命令）
-        verify_box = QGroupBox("3. 验证连通性（服务就绪后，在宿主机另开终端）")
-        lay3 = QVBoxLayout(verify_box)
-        lay3.setSpacing(4)
+        # ---------- 2. 验证连通性（按输入自动生成命令）
+        verify_box = QGroupBox("2. 验证连通性（服务就绪后，在宿主机另开终端）")
+        lay2 = QVBoxLayout(verify_box)
+        lay2.setSpacing(4)
+        self.verify_ip_edit = QLineEdit()
+        self.verify_ip_edit.setPlaceholderText(VERIFY_DEFAULT_HOST + "（默认本机）")
+        self.verify_ip_edit.setFixedWidth(190)
+        self.verify_ip_edit.setToolTip(
+            "验证命令指向的服务器 IP / 主机名：在服务器本机执行时留空\n"
+            "（即 127.0.0.1）；从其他机器执行时填目标服务器 IP。\n"
+            "修改后下方验证命令自动更新，「执行连通性测试」同样使用该地址\n"
+            "（测试经由 SSH 在目标服务器上执行，通常留空即可）。")
         self.verify_port_edit = QLineEdit(VERIFY_DEFAULT_PORT)
         self.verify_port_edit.setFixedWidth(90)
         self.verify_port_edit.setToolTip(
@@ -228,39 +218,141 @@ class ServicePage(QWidget):
         self.verify_model_edit.setToolTip(
             "验证对话时使用的模型名：vLLM 中为 --served-model-name 或\n"
             "模型路径名，须与 vllm serve 的模型一致。修改后下方命令自动更新。")
+        self.verify_btn = QPushButton("▶ 执行连通性测试")
+        self.verify_btn.setToolTip(
+            "通过 SSH 在目标服务器上自动执行下方三条 curl 命令\n"
+            "并逐项判定（PASS/FAIL 结果写入任务日志）。")
+        self.verify_btn.clicked.connect(self._run_verify)
         verify_inputs = QHBoxLayout()
+        verify_inputs.addWidget(QLabel("服务器 IP"))
+        verify_inputs.addWidget(self.verify_ip_edit)
+        verify_inputs.addSpacing(12)
         verify_inputs.addWidget(QLabel("端口"))
         verify_inputs.addWidget(self.verify_port_edit)
         verify_inputs.addSpacing(12)
         verify_inputs.addWidget(QLabel("模型名"))
         verify_inputs.addWidget(self.verify_model_edit)
+        verify_inputs.addSpacing(12)
+        verify_inputs.addWidget(self.verify_btn)
         verify_inputs.addStretch(1)
         verify_hint = QLabel(
-            "填写端口与模型名后，下方命令自动生成（服务就绪后，在宿主机"
-            "另开一个终端执行）。")
+            "填写端口与模型名后，下方命令自动生成。可复制到宿主机另开的终端执行，"
+            "或点击「执行连通性测试」由工具通过 SSH 自动执行。")
         verify_hint.setProperty("role", "hint")
         verify_hint.setWordWrap(True)
         self.verify_view = _readonly_view(build_verify_command())
+        self.verify_ip_edit.textChanged.connect(self._update_verify_cmd)
         self.verify_port_edit.textChanged.connect(self._update_verify_cmd)
         self.verify_model_edit.textChanged.connect(self._update_verify_cmd)
-        lay3.addWidget(verify_hint)
-        lay3.addLayout(verify_inputs)
-        lay3.addWidget(self.verify_view, 1)
+        # 连通性测试任务面板（单服务器执行）
+        self.panel = ParallelTaskPanel(self)
+        lay2.addWidget(verify_hint)
+        lay2.addLayout(verify_inputs)
+        lay2.addWidget(self.verify_view, 1)
+        lay2.addWidget(self.panel)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)              # 与步骤3/4 一致：模块间顺序感
-        # UCM 配置模板仅 9 行：按内容自适应高度（避免编辑框下方留白），
-        # 窗口富余的高度让给内容更多的拉起命令与验证命令区
-        layout.addWidget(cfg_box, 0)
         layout.addWidget(cmd_box, 1)
         layout.addWidget(verify_box, 1)
 
     # ------------------------------------------------------------ 辅助
+    def _sync_cmd_path(self, path: str) -> None:
+        """步骤3「UCM 文件配置」写入路径变化时，同步拉起命令中的
+        UCM_CONFIG_FILE 并更新高亮。"""
+        path = (path or "").strip() or CFG_DEFAULT_PATH
+        if path == self._cmd_path:
+            return
+        template = START_CMD_TEMPLATE.replace(self._cmd_path, path)
+        self._cmd_path = path
+        # <pre> 会把结尾换行渲染成多余空行，与 _readonly_html_view 保持一致
+        self.cmd_view.setHtml("<pre>"
+                              + _render_highlighted(template.rstrip("\n"),
+                                                    (path,))
+                              + "</pre>")
+
+    def _run_verify(self) -> None:
+        """通过 SSH 在目标服务器上执行三条 curl，逐项判定连通性。"""
+        port = self.verify_port_edit.text().strip() or VERIFY_DEFAULT_PORT
+        model = self.verify_model_edit.text().strip() or VERIFY_DEFAULT_MODEL
+        if not self.ctx.selected:
+            QMessageBox.information(
+                self, "提示", "请先在步骤1 选定目标服务器，再执行连通性测试")
+            return
+        server = self.ctx.selected[0]
+        host = self.verify_ip_edit.text().strip() or VERIFY_DEFAULT_HOST
+        base = f"http://{host}:{port}"
+        # JSON 载荷单行传递；单引号按 POSIX 规则转义，避免破坏 shell 引号
+        payload = _json.dumps({
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain the role of KV cache in large "
+                               "language model inference.",
+                },
+            ],
+            "max_completion_tokens": 512,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }, ensure_ascii=False).replace("'", "'\\''")
+        checks = [
+            ("服务健康检查 /health",
+             f"curl --fail -s -o /dev/null -w '%{{http_code}}' {base}/health"),
+            ("模型列表 /v1/models",
+             f"curl --fail -s {base}/v1/models"),
+            ("对话验证 /v1/chat/completions",
+             f"curl --fail-with-body -s {base}/v1/chat/completions "
+             f"-H 'Content-Type: application/json' -d '{payload}'"),
+        ]
+
+        def fn(ssh, tctx):
+            tctx.log(f"在 {server.endpoint} 上执行连通性测试"
+                     f"（端口 {port}，模型 {model}）")
+            tctx.log("提示：服务需以 --network host 或端口映射方式暴露端口")
+            fails = 0
+            total = len(checks)
+            for i, (name, cmd) in enumerate(checks, 1):
+                if tctx.cancelled():
+                    raise RuntimeError("已取消")
+                tctx.progress(int(100 * (i - 1) / total), f"{name} ...")
+                tctx.log(f"[{i}/{total}] {name}")
+                res = ssh.exec(cmd, timeout=60)
+                if res.ok:
+                    out = res.stdout.strip()
+                    if i == 1 and out.isdigit():
+                        tctx.log(f"  → HTTP {out}")
+                    elif out:
+                        preview = out if len(out) <= 160 else out[:160] + " ..."
+                        tctx.log(f"  → {preview}")
+                    tctx.log(f"  ✅ PASS：{name}")
+                else:
+                    fails += 1
+                    detail = (res.stderr.strip() or res.stdout.strip()
+                              or f"退出码 {res.exit_code}")
+                    tctx.log(f"  ❌ FAIL：{name}（{detail}）")
+            if fails:
+                tctx.log("排查提示：服务是否已就绪 / 端口是否一致 / "
+                         "容器是否 --network host；可在容器内 "
+                         f"curl 127.0.0.1:{port}/health 进一步定位")
+                raise RuntimeError(f"{fails}/{total} 项未通过")
+            tctx.log(f"✅ 连通性测试 {total}/{total} 全部通过")
+            tctx.progress(100, "连通性测试全部通过 ✅")
+
+        self.panel.run_tasks([(server, fn)], "连通性测试（目标服务器上执行）")
+
     def _update_verify_cmd(self) -> None:
-        """按当前输入的端口/模型名重新生成验证连通性命令。"""
+        """按当前输入的服务器 IP/端口/模型名重新生成验证连通性命令。"""
         self.verify_view.setPlainText(build_verify_command(
-            self.verify_port_edit.text(), self.verify_model_edit.text()))
+            self.verify_ip_edit.text(), self.verify_port_edit.text(),
+            self.verify_model_edit.text()))
 
     def on_enter(self) -> None:
-        """纯指引页无动态内容，保留钩子以兼容主窗口 on_enter 调用。"""
+        """进入页面时按步骤3 写入的 UCM 配置路径同步拉起命令模板。"""
+        server = self.ctx.server
+        if server is None:
+            return
+        path = self.ctx.ucm_config_paths.get(server.id)
+        if path:
+            self._sync_cmd_path(path)

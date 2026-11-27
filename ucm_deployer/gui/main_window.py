@@ -31,13 +31,14 @@ from .widgets.server_page import ServerPage
 from .widgets.service_page import ServicePage
 
 _STEPS = [
-    ("步骤1：服务器管理", "登录服务器并探测设备型号、卡数与 CPU 架构"),
-    ("步骤2：镜像准备", "复用已含 UCM 的镜像，或按需构建新 UCM 镜像"),
-    ("步骤3：容器准备", "按需创建 UCM 容器；已有容器可直接进入步骤4"),
-    ("步骤4：环境预检", "显式选择容器并运行 UCM 环境预检"),
-    ("步骤5：服务部署", "写入 UCM 配置文件并在容器内拉起推理服务；多台服务器请用下方批量部署"),
+    ("步骤1：服务器管理", "登录服务器并环境检测：设备型号、卡数、CPU 架构与 CANN/内存/Docker/共享内存/AIO"),
+    ("步骤2：UCM镜像准备", "复用已含 UCM 的镜像，或按需构建新 UCM 镜像"),
+    ("步骤3：UCM容器部署", "按需创建 UCM 容器并写入 UCM 配置文件；已有容器可直接进入步骤4"),
+    ("步骤4：UCM容器环境复检", "显式选择容器并运行 UCM 容器环境复检"),
     ("（可选）批量部署",
-     "多台服务器时使用：一键分发镜像、创建容器并预检；支持模板导入导出。单台直接走步骤3/4"),
+     "多台服务器时使用：一键分发镜像、创建容器并复检；支持模板导入导出。单台直接走步骤3/4"),
+    ("步骤5：推理服务部署",
+     "在容器内拉起推理服务并自动验证连通性；UCM 配置文件已在步骤3 写入容器；多台服务器请用批量部署"),
 ]
 
 
@@ -132,8 +133,9 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._wrap_scroll(self.image_page))
         self.pages.addWidget(self._wrap_scroll(self.container_page))
         self.pages.addWidget(self._wrap_scroll(self.precheck_page))
-        self.pages.addWidget(self._wrap_scroll(self.service_page))
+        # 批量部署位于步骤4（环境复检）与步骤5（推理服务拉起）之间
         self.pages.addWidget(self._wrap_scroll(self.batch_page))
+        self.pages.addWidget(self._wrap_scroll(self.service_page))
 
         center = QHBoxLayout()
         center.setContentsMargins(12, 12, 12, 12)
@@ -245,7 +247,7 @@ class MainWindow(QMainWindow):
     def _all_panels(self):
         return [p.panel for p in (self.server_page, self.image_page,
                                   self.container_page, self.precheck_page,
-                                  self.batch_page)]
+                                  self.batch_page, self.service_page)]
 
     # ------------------------------------------------------------ 导航
     def goto_step(self, row: int) -> None:
@@ -272,9 +274,9 @@ class MainWindow(QMainWindow):
         elif row == 3:
             self.precheck_page.on_enter()
         elif row == 4:
-            self.service_page.on_enter()
-        elif row == 5:
             self.batch_page.on_enter()
+        elif row == 5:
+            self.service_page.on_enter()
 
         self._active_row = row
         self.pages.setCurrentIndex(row)

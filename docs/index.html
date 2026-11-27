@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="UCM Deployer 使用文档 - UCM 安装与环境预检工具：服务器管理、镜像准备、容器准备、容器内环境预检">
+<meta name="description" content="UCM Deployer 使用文档 - UCM 安装与环境检测工具：服务器管理（环境检测）、UCM镜像准备、UCM容器环境准备、容器内环境复检">
 <meta name="theme-color" content="#2563eb">
 <title>UCM Deployer 使用文档</title>
 <style>
@@ -250,19 +250,19 @@ footer {
 </head>
 <body>
 <aside class="sidebar">
-  <div class="logo">UCM Deployer<small>UCM 安装与环境预检</small></div>
+  <div class="logo">UCM Deployer<small>UCM 安装与环境检测</small></div>
   <nav>
     <div class="nav-group">开始</div>
     <a class="nav-link" href="#intro">工具简介</a>
     <a class="nav-link" href="#quickstart">快速开始</a>
-    <div class="nav-group">安装与预检流程</div>
+    <div class="nav-group">安装与检测流程</div>
     <a class="nav-link" href="#step1"><span class="num">1</span>服务器管理</a>
-    <a class="nav-link" href="#step2"><span class="num">2</span>镜像准备</a>
-    <a class="nav-link" href="#step3"><span class="num">3</span>容器准备</a>
-    <a class="nav-link" href="#step4"><span class="num">4</span>环境预检</a>
-    <a class="nav-link" href="#step5"><span class="num">5</span>服务部署</a>
+    <a class="nav-link" href="#step2"><span class="num">2</span>UCM镜像准备</a>
+    <a class="nav-link" href="#step3"><span class="num">3</span>UCM容器环境准备</a>
+    <a class="nav-link" href="#step4"><span class="num">4</span>UCM容器环境预检</a>
+    <a class="nav-link" href="#step5"><span class="num">5</span>推理服务拉起</a>
     <div class="nav-group">进阶</div>
-    <a class="nav-link" href="#batch">（可选）批量部署</a>
+    <a class="nav-link" href="#batch"><span class="num">6</span>（可选）批量部署</a>
     <a class="nav-link" href="#precheck-config">预检参数配置</a>
     <a class="nav-link" href="#tools">容器与镜像清理</a>
     <a class="nav-link" href="#faq">常见问题</a>
@@ -273,24 +273,24 @@ footer {
 <div class="main">
 <header class="hero">
   <h1>UCM Deployer</h1>
-  <p class="lead">面向 vLLM / vLLM-Ascend / SGLang 运行环境的 Windows 桌面工具。专注 UCM 安装、环境预检与服务部署：服务器管理、镜像准备、容器准备、容器内检查、推理服务拉起与运维清理。</p>
+  <p class="lead">面向 vLLM / vLLM-Ascend / SGLang 运行环境的 Windows 桌面工具。专注 UCM 安装、环境检测与推理服务拉起：服务器管理（环境检测）、UCM镜像准备、UCM容器环境准备、容器内复检、推理服务拉起与运维清理。</p>
   <div class="actions">
     <a class="btn btn-primary" href="#quickstart">快速开始</a>
     <a class="btn btn-outline" href="https://github.com/ucm-system/UCM-Deployer/releases/latest/download/UCM-Deployer.exe">下载 EXE</a>
   </div>
-  <p class="meta">当前版本 v0.6.0 · 支持 Ascend NPU · NVIDIA GPU · Linux 服务器 · Docker</p>
+  <p class="meta">当前版本 v0.6.1 · 支持 Ascend NPU · NVIDIA GPU · Linux 服务器 · Docker</p>
 </header>
 
 <div class="container">
 <section id="intro">
   <h2>工具简介</h2>
-  <p>UCM Deployer 是 Unified Cache Management（UCM）的安装、环境预检与服务部署工具。它把原本需要手工执行的 SSH 命令、镜像导入、离线 whl 安装、<code>docker run</code> 参数拼装和容器内环境检查，收敛为五个向导步骤（另提供面向多台服务器场景的可选批量部署）；步骤 5 支持一键写入 UCM 配置文件并在容器内拉起推理服务。</p>
+  <p>UCM Deployer 是 Unified Cache Management（UCM）的安装、环境检测与推理服务拉起工具。它把原本需要手工执行的 SSH 命令、镜像导入、离线 whl 安装、<code>docker run</code> 参数拼装、UCM 配置文件写入和容器内环境检查，收敛为五个向导步骤（另提供面向多台服务器场景的可选批量部署）；步骤 3 完成容器创建与 UCM 文件配置，步骤 5 提供拉起命令指引与连通性自动验证。</p>
   <div class="flow">
-    <div class="step"><strong>① 服务器管理</strong>SSH 登录与设备探测</div>
-    <div class="step"><strong>② 镜像准备</strong>复用或构建 UCM 镜像</div>
-    <div class="step"><strong>③ 容器准备</strong>创建或复用 UCM 容器</div>
-    <div class="step"><strong>④ 环境预检</strong>驱动 / 内核 / 带宽 / SMMU 检查</div>
-    <div class="step"><strong>⑤ 服务部署</strong>UCM 配置与拉起命令操作指引</div>
+    <div class="step"><strong>① 服务器管理</strong>SSH 登录与环境检测（设备 / CANN / 内存 / Docker）</div>
+    <div class="step"><strong>② UCM镜像准备</strong>复用或构建含 UCM 的镜像</div>
+    <div class="step"><strong>③ UCM容器环境准备</strong>创建或复用 UCM 推理容器</div>
+    <div class="step"><strong>④ UCM容器环境预检</strong>驱动 / 内核 / 带宽 / SMMU 检查</div>
+    <div class="step"><strong>⑤ 推理服务拉起</strong>拉起命令指引与连通性自动测引</div>
     <div class="step"><strong>可选</strong>批量部署（多台服务器）</div>
   </div>
   <div class="cards">
@@ -299,8 +299,8 @@ footer {
     <div class="card"><h3>镜像准备</h3><p>单一来源选择器：复用服务器镜像、离线导入 tar 包，或由目标服务器直连仓库拉取；本地无需 Docker Desktop。</p></div>
     <div class="card"><h3>按需构建</h3><p>仅在基础镜像未安装 UCM 时上传 wrapt、UCM、ucm-toolkit whl 并构建新镜像。</p></div>
     <div class="card"><h3>命令透明</h3><p>所有 Docker 命令先完整展示，允许编辑，再执行，避免黑盒操作。</p></div>
-    <div class="card"><h3>环境预检</h3><p>显式选择容器，检查驱动、内核、共享内存、AIO、存储带宽与 SMMU；UCM 与驱动版本支持多来源补齐。</p></div>
-    <div class="card"><h3>服务部署</h3><p>UCM 配置参考模板与官方参数文档、拉起命令模板（环境变量 + --kv-transfer-config 接入）与连通性验证 curl，一键复制照做即可。</p></div>
+    <div class="card"><h3>UCM容器环境预检</h3><p>显式选择容器，检查驱动、内核、共享内存、AIO、存储带宽与 SMMU；UCM 与驱动版本支持多来源补齐。</p></div>
+    <div class="card"><h3>推理服务拉起</h3><p>拉起命令模板（环境变量 + --kv-transfer-config 接入）与连通性自动测、拉起命令模板（环境变量 + --kv-transfer-config 接入）与连通性验证 curl，一键复制照做即可。</p></div>
     <div class="card"><h3>运维善后</h3><p>按关键字筛选并清理容器或镜像，删除前展示完整对象列表。</p></div>
   </div>
   <figure class="figure">
@@ -342,16 +342,16 @@ python -m venv .venv
 <section id="step1">
   <span class="step-badge">步骤 1</span>
   <h2>服务器管理</h2>
-  <p>登录要操作的服务器并探测设备信息。一次只登录一台服务器，后续所有操作都作用于当前勾选的服务器。</p>
+  <p>登录要操作的服务器并执行环境检测（设备 + 宿主机）。一次只登录一台服务器，后续所有操作都作用于当前勾选的服务器；多台服务器可用「🧪 批量测试连接」与「🔍 批量环境检测」并行处理，每台独立日志页签。</p>
   <figure class="figure">
     <img src="screenshots/step1-servers.png" alt="服务器管理界面" loading="lazy">
-    <figcaption>服务器列表包含登录状态、设备类型、型号、卡数、CPU 架构与备注</figcaption>
+    <figcaption>服务器列表包含登录状态、设备类型、型号、卡数、CPU 架构、检测结果（环境检测汇总，悬浮看明细）与备注</figcaption>
   </figure>
   <h3>操作流程</h3>
   <ol>
     <li>点击「➕ 添加服务器」，填写名称、地址、账号、认证方式与备注。</li>
     <li>点击「🔌 测试连接」确认 SSH 可达。</li>
-    <li>点击「🔍 探测设备」，自动识别设备类型、型号、卡数与 CPU 架构，并同步<strong>预检宿主机环境</strong>（加速器驱动 / 内核版本 / SMMU，与步骤 4 同一套判定口径，提前暴露基础环境问题）。</li>
+    <li>点击「🔍 环境检测」，自动识别设备类型、型号、卡数与 CPU 架构，并同步<strong>预检宿主机环境</strong>（加速器驱动 / 内核版本 / SMMU，与步骤 4 同一套判定口径，提前暴露基础环境问题）。</li>
     <li>勾选「登录」，选择本次操作目标。</li>
   </ol>
   <figure class="figure">
@@ -370,7 +370,7 @@ python -m venv .venv
     </tbody>
   </table>
   <div class="callout">
-    <b>环境预检结果</b>
+    <b>环境检测结果</b>
     驱动 / 内核 / SMMU 检查结果逐项写入任务日志（PASS / WARN / FAIL / SKIP）；存在 FAIL 项会弹窗提示——建议先修复环境，再准备镜像与创建容器。
   </div>
   <div class="callout warn">
@@ -381,7 +381,7 @@ python -m venv .venv
 
 <section id="step2">
   <span class="step-badge">步骤 2</span>
-  <h2>镜像准备</h2>
+  <h2>UCM镜像准备</h2>
   <p>优先复用已安装 UCM 的镜像；仅在确需制作新镜像时，才把 wrapt、UCM 与可选的 ucm-toolkit 安装进基础镜像。</p>
   <figure class="figure">
     <img src="screenshots/step2-build.png" alt="镜像准备界面" loading="lazy">
@@ -417,7 +417,7 @@ python -m venv .venv
 
 <section id="step3">
   <span class="step-badge">步骤 3</span>
-  <h2>容器准备</h2>
+  <h2>UCM容器环境准备</h2>
   <p>可基于 UCM 镜像创建新容器；如果服务器上已有安装 UCM 的容器，可跳过创建，直接进入步骤 4 选择该容器预检。创建前自动检测同名容器：已存在同名容器时明确提示（不会执行到 <code>docker run</code> 才因容器名冲突失败），可通过「工具 → 清理指定容器」删除后再创建。</p>
   <figure class="figure">
     <img src="screenshots/step3-container.png" alt="容器准备界面" loading="lazy">
@@ -427,7 +427,7 @@ python -m venv .venv
   <p>进入页面后自动加载镜像列表。选择镜像时会后台校验 UCM 是否安装：已安装则显示版本；未安装则提示回步骤 2 构建或更换镜像。</p>
   <div class="callout">
     <b>复用已有容器</b>
-    若目标容器已安装 UCM，无需重复创建。直接进入步骤 4，刷新容器列表并选择该容器即可开始环境预检。
+    若目标容器已安装 UCM，无需重复创建。直接进入步骤 4，刷新容器列表并选择该容器即可开始环境复检。
   </div>
   <h3>容器参数</h3>
   <p>进入页面后自动探测实际存在的 Ascend 设备节点与系统挂载。兼容 Ascend950PR / A5：缺失 <code>/dev/devmm_svm</code> 时不生成该参数，存在 <code>/dev/ummu</code> 或 <code>/dev/uburma</code> 时自动添加 <code>--privileged=true</code>。</p>
@@ -488,10 +488,10 @@ docker run -itd \\
 
 <section id="step4">
   <span class="step-badge">步骤 4</span>
-  <h2>环境预检</h2>
-  <p>显式选择目标容器，并在该容器内运行 <code>ucm-toolkit run precheck</code>，提前发现可能影响 UCM 启动或缓存读写的问题。若镜像内未安装 ucm-toolkit 或预检未产出任何检查项，预检会<strong>明确报错并给出排查指引</strong>（如回步骤 2 重装 UCM 组件 / 重建镜像），不会把失败伪装成全部通过。</p>
+  <h2>UCM容器环境预检</h2>
+  <p>显式选择目标容器，并在该容器内运行 <code>ucm-toolkit run precheck</code>，复检容器内环境，提前发现可能影响 UCM 启动或缓存读写的问题（宿主机侧的驱动/内核/SMMU/CANN/内存/Docker 检测在步骤1 环境检测完成）。若镜像内未安装 ucm-toolkit 或预检未产出任何检查项，预检会<strong>明确报错并给出排查指引</strong>（如回步骤 2 重装 UCM 组件 / 重建镜像），不会把失败伪装成全部通过。</p>
   <figure class="figure">
-    <img src="screenshots/step4-precheck.png" alt="环境预检界面" loading="lazy">
+    <img src="screenshots/step4-precheck.png" alt="环境复检界面" loading="lazy">
     <figcaption>先显式选择目标容器；结果以表格与详情联动展示，包含状态、阈值与中文排查建议</figcaption>
   </figure>
   <h3>选择目标容器</h3>
@@ -502,7 +502,7 @@ docker run -itd \\
   </ol>
   <div class="callout">
     <b>支持已有容器</b>
-    服务器上已经创建且安装 UCM 的容器无需重建；刷新并选择该容器后，可直接执行环境预检。
+    服务器上已经创建且安装 UCM 的容器无需重建；刷新并选择该容器后，可直接执行环境复检。
   </div>
   <h3>检查模式</h3>
   <table>
@@ -540,76 +540,35 @@ docker run -itd \\
 </section>
 
 <section id="step5">
-  <span class="step-badge">步骤 5</span>
-  <h2>服务部署</h2>
-  <p>纯操作指引页，三个模块按操作顺序排布，所有命令与配置均可直接复制使用；需要按环境修改的片段以<strong>黄底高亮</strong>显示；模块 3 的验证命令按输入的端口与模型名<strong>自动生成</strong>，可直接复制执行。</p>
-  <h3>① UCM 配置文件</h3>
-  <p>页面给出 UCM 配置文件参考默认配置（<code>UcmPipelineStore</code> 连接器，<code>Cache|Posix</code> 存储管线），存储路径、容量与并发等参数按实际环境修改：</p>
-  <pre><code>ucm_connectors:
-  - ucm_connector_name: "UcmPipelineStore"
-    ucm_connector_config:
-      store_pipeline: "Cache|Posix"
-      storage_backends: "/mnt/test"
-      posix_capacity_gb: 10240
-      posix_io_engine: "psync"
-      posix_data_trans_concurrency: 128
-</code></pre>
-  <p>将配置保存为 yaml 文件（如 <code>/workspace/ucm_config_example.yaml</code>，路径可自定义，需与拉起命令中 <code>UCM_CONFIG_FILE</code> 保持一致）；详细参数说明见配置框下方的 <a href="https://support.huawei.com/enterprise/zh/doc/EDOC1100582752/b4b5937b?idPath=7919749%7C251366268%7C250389224%7C263153904%7C268354339">UCM 参数配置说明（华为官方文档，可点击跳转）</a>。</p>
-  <h3>② 推理服务拉起命令（在容器内执行）</h3>
-  <p><strong>注意事项：</strong></p>
-  <ol>
-    <li>拉起服务前需先导出环境变量：<code>export ENABLE_UCM_PATCH=1</code>、<code>export VLLM_CPU_AFFINITY=1</code>；</li>
-    <li>拉起命令后必须附加 <code>--kv-transfer-config</code>，通过 UCMConnector 把 UCM 接入 vLLM；</li>
-    <li>其中 <code>UCM_CONFIG_FILE</code> 为 UCM 配置文件路径，指向①中保存的 yaml（可自定义修改，两处路径必须一致）。</li>
-  </ol>
-  <pre><code>export ENABLE_UCM_PATCH=1
-export VLLM_CPU_AFFINITY=1
-
-vllm serve /models/Qwen ... \
-    --kv-transfer-config '{
-        "kv_connector": "UCMConnector",
-        "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": {
-            "UCM_CONFIG_FILE": "/workspace/ucm_config_example.yaml"
-        }
-    }'
-</code></pre>
-  <p>模板中的模型路径 / 端口等参数按实际填写。</p>
-  <h3>③ 验证连通性（服务就绪后，在宿主机另开终端）</h3>
-  <p>在页面输入框填写服务<strong>端口</strong>（默认 <code>7800</code>）与<strong>模型名</strong>（默认 <code>qwen3.8</code>，须与 <code>vllm serve</code> 的模型一致），下方验证命令<strong>自动生成</strong>：</p>
-  <pre><code>curl --fail http://127.0.0.1:7800/health
-curl --fail http://127.0.0.1:7800/v1/models
-
-curl --fail-with-body http://127.0.0.1:7800/v1/chat/completions \
-    -H 'Content-Type: application/json' \
-    -d '{
-        "model": "qwen3.8",
-        "messages": [
-            {
-                "role": "user",
-                "content": "Explain the role of KV cache in large language model inference."
-            }
-        ],
-        "max_completion_tokens": 512,
-        "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": false}
-    }'
-</code></pre>
-  <div class="callout">
-    <b>可复制 + 可拖高</b>
-    三个模块的配置 / 命令展示框均可直接选中复制，右下角拖动手柄可调整高度，方便完整查看长命令。
-  </div>
+<span class="step-badge">步骤 5</span>
+<h2>推理服务拉起</h2>
+<p>拉起命令指引 + 自动验证：UCM 配置文件的编辑与写入已在步骤 3「UCM 文件配置」模块完成（批量部署由右上角「创建容器并配置UCM文件」开关一并执行）；本页给出容器内执行的拉起命令模板（需修改片段<strong>黄底高亮</strong>，<code>UCM_CONFIG_FILE</code> 与步骤 3 写入路径联动），验证命令按输入的服务器 IP、端口与模型名自动生成——可复制到宿主机另开的终端手工执行，也可点击「⚡ 执行连通性测试」由工具通过 SSH <strong>自动执行并逐项判定</strong>。</p>
+<h3>① 推理服务拉起命令（在容器内执行）</h3>
+<p><strong>注意事项：</strong></p>
+<ol>
+<li>拉起服务前需先导出环境变量：<code>export ENABLE_UCM_PATCH=1</code>、<code>export VLLM_CPU_AFFINITY=1</code>；</li>
+<li>拉起命令后必须附加 <code>--kv-transfer-config</code>，通过 UCMConnector 使 vLLM 接入 UCM；</li>
+<li>其中 <code>UCM_CONFIG_FILE</code> 为 UCM 配置文件路径，指向步骤 3「UCM 文件配置」写入容器内的 yaml（可自定义修改，两处路径必须一致）；</li>
+<li><strong>PD 分离部署</strong>时，<code>--kv-transfer-config</code> 只需在 Prefill 实例的拉起命令中添加，Decode 实例无需添加。</li>
+</ol>
+<h3>② 验证连通性（服务就绪后，在宿主机另开终端）</h3>
+<p>在页面输入框填写服务<strong>服务器 IP</strong>（留空即 <code>127.0.0.1</code>，从其他机器执行时填目标 IP）、<strong>端口</strong>（默认 <code>7800</code>）与<strong>模型名</strong>（默认 <code>qwen3.8</code>，须与 <code>vllm serve</code> 的模型一致），下方验证命令<strong>自动生成</strong>；点击「⚡ 执行连通性测试」由工具通过 SSH 在目标服务器上自动执行三项检查并逐项判定（PASS/FAIL 结果写入任务日志）：服务健康检查 <code>/health</code>、模型列表 <code>/v1/models</code>、对话验证 <code>/v1/chat/completions</code>（完整 JSON 载荷、关闭思维链、校验回复内容），失败时给出排查提示。</p>
+<div class="callout">
+<b>唯一执行入口</b>
+连通性测试通过任务面板在后台执行（单服务器）；写入 UCM 配置文件的操作已前移到步骤 3 / 批量部署，避免两处重复填写。
+</div>
 </section>
 
 <section id="batch">
+  <span class="step-badge">步骤 4 之后</span>
   <h2>（可选）批量部署</h2>
-  <p>面向<strong>多台服务器</strong>场景：在一台源服务器制作好镜像后，向多台目标并行执行「镜像分发 → 容器创建 → 环境预检」。单台服务器场景请直接使用步骤 3 / 4 / 5，无需本功能。</p>
-  <ul>
-    <li><strong>布局自上而下</strong>：镜像来源 → 目标服务器 → 部署配置模板 → 批量执行，与步骤 1-4 阅读顺序一致；上半（目标服务器 + 配置）与下半（批量执行 + 任务面板）<strong>可拖分栏</strong>，任务运行时进度表与日志可按需扩高。</li>
-    <li><strong>目标服务器来自步骤 1</strong>：列表与「服务器管理」完全一致，步骤 1 增删改后点「🔄 刷新」同步；注册表为空时表格显示引导；新增 <strong>「环境」列</strong>展示步骤 1 宿主机环境预检汇总（PASS / WARN / FAIL / 未探测，悬浮查看驱动、内核、SMMU 各项明细）。</li>
-    <li><strong>部署配置模板</strong>双页签（容器配置 / 预检配置），挂载配置同样使用统一挂载表，设备差异逐台自动适配；预检 JSON 编辑框预填常用配置模板（内核版本 / 带宽参数，叠加于 ucm-toolkit 出厂默认之上，只需写要覆盖的键）；支持勾选<strong>「自定义 docker run 命令」</strong>（同构集群整条执行，<code>{image}</code> 占位符自动替换镜像，可一键生成样例）。</li>
-    <li><strong>独立进度与日志</strong>：每台服务器一行进度条（分发 45% / 创建 25% / 预检 30% 权重）与独立日志页签，单台失败不影响其余；<strong>部署可随时取消</strong>（远端长任务同步中断）；容器创建后自动确认运行状态（启动即退出时立即诊断并提示 <code>docker logs</code> 定位）；结束后汇总弹窗简短标注每台结果，完整失败原因见各服务器日志页签；支持部署数据模板（JSON）导出 / 导入复用。</li>
+  <p>面向<strong>多台服务器</strong>场景：在一台源服务器制作好镜像后，向多台目标并行执行「镜像分发 → 创建容器并配置UCM文件 → 环境预检」。单台服务器场景请直接使用步骤 3 / 4 / 5，无需本功能。</p>
+<ul>
+<li><strong>镜像分发三方式</strong>：<strong>镜像包中转</strong>（源服务器 <code>docker save -o</code> 导出 → 本机中转 → 各目标 <code>docker load</code>）、<strong>镜像仓库拉取</strong>（各目标从仓库拉取）、<strong>服务器直传</strong>（源服务器 <code>docker save -o</code> 导出 → 各目标经服务器间 scp 拉取 → <code>docker load</code>，镜像不经本机、不占本机磁盘与带宽）；tar / 直传模式下源服务器先导出镜像包，目标保存路径可配置（默认 <code>/tmp</code>，大镜像包可指定如 <code>/data</code>），<code>docker load</code> 校验完成后自动清理临时包，全部结束后源端镜像包自动清理；直传的密码认证优先 sshpass，目标未安装时自动改用 OpenSSH 自带的 <code>SSH_ASKPASS</code> 机制代输（免安装，临时脚本 700 权限、传输后立即删除；OpenSSH &gt;= 8.4 无需额外依赖）。</li>
+<li><strong>布局自上而下</strong>：镜像来源 → 目标服务器 → 部署配置模板 → 批量执行，与步骤 1-4 阅读顺序一致；上半（目标服务器 + 配置）与下半（批量执行 + 任务面板）<strong>可拖分栏</strong>，任务运行时进度表与日志可按需扩高。</li>
+    <li><strong>目标服务器来自步骤 1</strong>：列表与「服务器管理」完全一致；**点击行任意位置即可勾选**（勾选行整行高亮），点「部署」列表头=全选/清空，右键菜单提供全选/清空/刷新列表；注册表为空时表格显示引导；新增 <strong>「环境」列</strong>展示步骤 1 宿主机环境检测汇总（PASS / WARN / FAIL / 未检测，悬浮查看驱动、内核、SMMU 各项明细）。</li>
+    <li><strong>部署配置</strong>四页签：<strong>镜像与分发</strong>（镜像来源 + 分发方式 + 目标保存路径）/ 容器配置（含「同名容器先删除再创建」、自定义 docker run 命令）/<strong>UCM文件配置</strong>（可编辑配置模板 + 容器内路径，是否写入由右上角「创建容器并配置UCM文件」开关决定——创建容器即写入）/<strong>预检配置</strong>，挂载配置同样使用统一挂载表，设备差异逐台自动适配；页签栏右上角为三个<strong>执行阶段开关</strong>（分发镜像 / 创建容器并配置UCM文件 / 环境预检），取消勾选则跳过该阶段（「创建容器并配置UCM文件」未勾选时「容器配置」与「UCM文件配置」两页签均不可选中；预检配置页签置灰；镜像与分发页签保持可编辑——仅禁用分发参数区，镜像名始终可填写，不分发时镜像须已存在于各目标服务器）；预检 JSON 编辑框预填常用配置模板（内核版本 / 带宽参数，叠加于 ucm-toolkit 出厂默认之上，只需写要覆盖的键），未勾选自定义时编辑框置灰仅作参考；支持勾选<strong>「自定义 docker run 命令」</strong>（同构集群整条执行，<code>{image}</code> 占位符自动替换镜像，可一键生成样例；与附加参数互斥置灰）；分发前<strong>总是自动检测</strong>目标已有同名镜像并跳过（重复执行安全）。</li>
+    <li><strong>独立进度与日志</strong>：每台服务器一行进度条（分发 45% / 创建 25% / 预检 30% 权重）与独立日志页签，单台失败不影响其余；<strong>部署可随时取消</strong>（远端长任务同步中断）；容器创建后自动确认运行状态（启动即退出时立即诊断并提示 <code>docker logs</code> 定位）；结束后汇总弹窗简短标注每台结果，完整失败原因见各服务器日志页签；挂载表支持「🔎 批量校验」——对全部勾选目标并行检查每个宿主机路径是否存在（<code>test -d</code>），结果与 <code>mkdir -p</code> 建议写入各服务器日志页签；支持整套部署模板（JSON）导出 / 导入：服务器登录信息（自动写入服务器管理并勾选为目标）+ 镜像与分发 + 容器/预检配置 + 执行阶段开关，一次配置他机复用。</li>
   </ul>
 </section>
 

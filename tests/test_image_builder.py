@@ -104,7 +104,7 @@ def test_match_no_device():
     r = validate_build_match(DeviceInfo(), "x86_64", "vllm/vllm-openai:latest",
                              "/tmp/uc.whl", "")
     assert not r.ok
-    assert any("未探测到" in e for e in r.errors)
+    assert any("未检测到" in e for e in r.errors)
 
 
 def test_match_unknown_image_warns():

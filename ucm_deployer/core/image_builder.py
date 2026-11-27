@@ -452,7 +452,7 @@ def validate_build_match(device: Optional[DeviceInfo], server_arch: str,
     runtime = image_runtime or ImageRuntimeInfo.from_image_ref(base_image)
 
     if device is None or device.device_type == DeviceType.UNKNOWN or device.count <= 0:
-        errors.append("服务器未探测到加速设备（请先在步骤1「探测设备」）")
+        errors.append("服务器未检测到加速设备（请先在步骤1「环境检测」）")
     else:
         plat = image_platform(base_image)
         if not plat:

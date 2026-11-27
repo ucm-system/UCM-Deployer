@@ -16,13 +16,16 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .container_manager import (
     ContainerCreateConfig,
     ContainerManager,
+    UCM_CONFIG_DEFAULT_PATH,
     ensure_container_removed,
+    write_ucm_config_file,
 )
 from .device_detector import DeviceDetector
 from .docker_manager import DockerError, DockerManager
@@ -173,6 +176,38 @@ class BatchPrecheckConfig:
 
 
 @dataclass
+class BatchUcmConfigConfig:
+    """UCM 配置文件写入参数（每台目标容器创建完成后写入，可选）。"""
+
+    enabled: bool = False
+    content: str = ""                      # yaml 文本
+    path: str = UCM_CONFIG_DEFAULT_PATH    # 容器内保存路径
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if not self.content.strip():
+            raise BatchDeployError("UCM 配置文件内容为空")
+        if not self.path.startswith("/"):
+            raise BatchDeployError(
+                f"UCM 配置文件路径必须是绝对路径: {self.path!r}")
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"enabled": self.enabled, "content": self.content,
+                "path": self.path}
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, object]]) -> "BatchUcmConfigConfig":
+        d = d or {}
+        cfg = cls()
+        cfg.enabled = bool(d.get("enabled", False))
+        cfg.content = str(d.get("content") or "")
+        cfg.path = (str(d.get("path") or "").strip()
+                    or UCM_CONFIG_DEFAULT_PATH)
+        return cfg
+
+
+@dataclass
 class BatchStages:
     """批量执行阶段开关。"""
 
@@ -236,10 +271,11 @@ class DeployTemplate:
     image_ref: str = ""
     source_host: str = ""                  # 源服务器主机（tar 模式提示用）
     source_port: int = 22
-    skip_existing: bool = True
+    target_tar_dir: str = "/tmp"           # 目标服务器上的镜像包保存目录
     recreate_container: bool = False       # 同名容器先删除再创建
     servers: List[ServerInfo] = field(default_factory=list)
     container: BatchContainerConfig = field(default_factory=BatchContainerConfig)
+    ucm_config: BatchUcmConfigConfig = field(default_factory=BatchUcmConfigConfig)
     precheck: BatchPrecheckConfig = field(default_factory=BatchPrecheckConfig)
     stages: BatchStages = field(default_factory=BatchStages)
 
@@ -253,10 +289,11 @@ class DeployTemplate:
                 "ref": self.image_ref,
                 "source_host": self.source_host,
                 "source_port": self.source_port,
-                "skip_existing": self.skip_existing,
+                "target_tar_dir": self.target_tar_dir,
                 "recreate_container": self.recreate_container,
             },
             "container": self.container.to_dict(),
+            "ucm_config": self.ucm_config.to_dict(),
             "precheck": self.precheck.to_dict(),
             "stages": self.stages.to_dict(),
             "servers": [s.to_dict(include_secret=include_secrets)
@@ -277,7 +314,7 @@ class DeployTemplate:
         image = data.get("image") or {}
         tpl = cls()
         tpl.image_mode = str(image.get("mode") or "tar")
-        if tpl.image_mode not in ("tar", "pull"):
+        if tpl.image_mode not in ("tar", "pull", "direct"):
             raise TemplateError(f"非法的镜像分发方式: {tpl.image_mode!r}")
         tpl.image_ref = str(image.get("ref") or "")
         tpl.source_host = str(image.get("source_host") or "")
@@ -285,7 +322,10 @@ class DeployTemplate:
             tpl.source_port = int(image.get("source_port") or 22)
         except (TypeError, ValueError):
             raise TemplateError("源服务器端口必须是数字") from None
-        tpl.skip_existing = bool(image.get("skip_existing", True))
+        # 旧模板中的 image.skip_existing 已废弃：分发前总是自动检测目标已有
+        # 同名镜像并跳过（此处不读取，导入旧模板自动忽略该键）
+        tpl.target_tar_dir = (str(image.get("target_tar_dir") or "")
+                              .strip() or "/tmp")
         tpl.recreate_container = bool(image.get("recreate_container", False))
 
         servers: List[ServerInfo] = []
@@ -309,10 +349,12 @@ class DeployTemplate:
                 remark=str(item.get("remark") or "")))
         tpl.servers = servers
         tpl.container = BatchContainerConfig.from_dict(data.get("container"))
+        tpl.ucm_config = BatchUcmConfigConfig.from_dict(data.get("ucm_config"))
         tpl.precheck = BatchPrecheckConfig.from_dict(data.get("precheck"))
         tpl.stages = BatchStages.from_dict(data.get("stages"))
         try:
             tpl.container.validate()
+            tpl.ucm_config.validate()
             tpl.precheck.validate()
         except BatchDeployError as exc:
             raise TemplateError(f"模板配置无效: {exc}") from exc
@@ -377,13 +419,13 @@ def upsert_servers_from_template(registry, servers: List[ServerInfo]
 def export_image_tar(ssh: SSHClient, docker: DockerManager, image_ref: str,
                      remote_path: str, log: Optional[LogFn] = None,
                      cancelled: Optional[CancelledFn] = None) -> None:
-    """在源服务器上导出镜像：docker save | gzip -1（失败自动清理半成品）。"""
+    """在源服务器上导出镜像：docker save -o（未压缩 tar，失败自动清理半成品）。"""
     log = log or (lambda line: None)
     if not docker.image_exists(image_ref):
         raise BatchDeployError(f"源服务器上不存在镜像 {image_ref}")
     if cancelled is not None and cancelled():
         raise BatchDeployError("已取消")
-    log(f"$ docker save {image_ref} | gzip -1 > {remote_path}")
+    log(f"$ docker save -o {remote_path} {image_ref}")
     try:
         docker.save_image(image_ref, remote_path, on_line=lambda line: log(line),
                           cancelled=cancelled)
@@ -395,9 +437,12 @@ def export_image_tar(ssh: SSHClient, docker: DockerManager, image_ref: str,
 def load_image_tar(ssh: SSHClient, docker: DockerManager, local_tar: str,
                    image_ref: str, progress: Optional[ProgressFn] = None,
                    log: Optional[LogFn] = None,
-                   cancelled: Optional[CancelledFn] = None) -> List[str]:
+                   cancelled: Optional[CancelledFn] = None,
+                   remote_dir: str = "/tmp") -> List[str]:
     """上传镜像包到目标服务器并 docker load（校验镜像后清理远端临时包）。
 
+    remote_dir 为目标服务器上的保存目录（绝对路径，默认 /tmp）；
+    大镜像包可指定大容量目录（如 /data），避免 /tmp 空间不足。
     返回 docker load 解析出的镜像引用列表。progress 收到 [0,100] 的
     分发阶段内部进度（调用方负责映射到整条流水线的区间）。
     """
@@ -408,10 +453,14 @@ def load_image_tar(ssh: SSHClient, docker: DockerManager, local_tar: str,
     if cancelled is not None and cancelled():
         raise BatchDeployError("已取消")
 
+    remote_dir = (remote_dir or "/tmp").strip() or "/tmp"
+    if not remote_dir.startswith("/"):
+        raise BatchDeployError(
+            f"目标服务器保存路径必须是绝对路径（以 / 开头）: {remote_dir}")
     name = os.path.basename(local_tar)
-    remote = f"/tmp/{name}"
+    remote = f"{remote_dir.rstrip('/')}/{name}"
     size = os.path.getsize(local_tar)
-    log(f"上传镜像包 {name}（{size / 1e6:.1f} MB）")
+    log(f"上传镜像包 {name}（{size / 1e6:.1f} MB）-> {remote}")
 
     def cb(sent: int, total: int) -> None:
         if cancelled is not None and cancelled():
@@ -429,6 +478,18 @@ def load_image_tar(ssh: SSHClient, docker: DockerManager, local_tar: str,
         raise BatchDeployError(f"上传镜像包失败: {exc}") from exc
 
     progress(65, "docker load ...")
+    refs = load_remote_tar(ssh, docker, remote, image_ref,
+                           progress=progress, log=log)
+    progress(100, f"镜像 {image_ref} 导入完成")
+    return refs
+
+
+def load_remote_tar(ssh: SSHClient, docker: DockerManager, remote: str,
+                    image_ref: str, progress: Optional[ProgressFn] = None,
+                    log: Optional[LogFn] = None) -> List[str]:
+    """docker load 目标服务器上已就位的镜像包并校验，完成后删除远端临时包。"""
+    progress = progress or (lambda pct, msg: None)
+    log = log or (lambda line: None)
     log(f"$ docker load -i {remote}")
     try:
         refs = docker.load_image(remote, on_line=lambda l: log(l))
@@ -442,8 +503,93 @@ def load_image_tar(ssh: SSHClient, docker: DockerManager, local_tar: str,
         loaded = "、".join(refs) if refs else "（无）"
         raise BatchDeployError(
             f"镜像包导入完成但未找到镜像 {image_ref}（加载出: {loaded}）")
-    progress(100, f"镜像 {image_ref} 导入完成")
     return refs
+
+
+def scp_image_between(ssh: SSHClient, source: ServerInfo, src_path: str,
+                      dst_path: str, progress: Optional[ProgressFn] = None,
+                      log: Optional[LogFn] = None,
+                      cancelled: Optional[CancelledFn] = None) -> None:
+    """服务器间直传：在目标服务器上用 scp 从源服务器拉取镜像包。
+
+    - 源服务器为密码认证：优先用 sshpass；目标未装 sshpass 时自动改用
+      OpenSSH 自带的 SSH_ASKPASS 机制代输密码（免安装，密码写入 700 权限
+      临时脚本、传输后立即删除；OpenSSH >= 8.4 走 SSH_ASKPASS_REQUIRE=force，
+      更旧版本需目标有 setsid）；
+    - 源服务器为密钥认证：直接 scp（需源→目标方向密钥可用）；
+    - 日志中不回显源服务器密码。失败时清理目标端半成品包。
+    """
+    progress = progress or (lambda pct, msg: None)
+    log = log or (lambda line: None)
+    remote_src = f"{source.username}@{source.host}:{src_path}"
+    askpass_path = ""
+    base = ""
+    shown = ""
+    if source.password:
+        res = ssh.exec("which sshpass", timeout=15)
+        if res.ok:
+            base = f"sshpass -p {shq(source.password)} "
+            shown = "sshpass -p **** "
+        else:
+            # 未装 sshpass：改用 OpenSSH 自带的 SSH_ASKPASS 机制代输密码
+            # （无需安装任何东西：密码写入 700 权限临时脚本，scp 读取后立即
+            # 删除；OpenSSH >= 8.4 用 SSH_ASKPASS_REQUIRE=force，更旧版本
+            # 需要 setsid 脱离终端让 scp 走 askpass）
+            askpass_path = f"/tmp/.ucm-askpass-{uuid.uuid4().hex[:8]}.sh"
+            try:
+                ssh.write_file(
+                    askpass_path, f"#!/bin/sh\necho {shq(source.password)}\n")
+                ssh.exec(f"chmod 700 {shq(askpass_path)}", timeout=15)
+                ver = ssh.exec("ssh -V", timeout=15)   # 版本号打印在 stderr
+                match = re.search(r"OpenSSH_(\d+)\.(\d+)",
+                                  f"{ver.stdout} {ver.stderr}")
+                force = bool(match and (
+                    int(match.group(1)) > 8
+                    or (int(match.group(1)) == 8 and int(match.group(2)) >= 4)))
+                if force:
+                    base = (f"SSH_ASKPASS={shq(askpass_path)} "
+                            f"SSH_ASKPASS_REQUIRE=force ")
+                else:
+                    sid = ssh.exec("which setsid", timeout=15)
+                    if not sid.ok:
+                        raise BatchDeployError(
+                            "目标服务器未安装 sshpass，且 OpenSSH 版本低于 8.4 "
+                            "或缺少 setsid，无法自动代输 scp 密码；"
+                            "请在目标服务器安装 sshpass 或改用「镜像包中转」方式")
+                    # 旧版 OpenSSH 启用 askpass 需 DISPLAY 非空：缺失时 ssh
+                    # 不调用 askpass 也无法从无 tty 的 stdin 读密码，scp 会
+                    # 一直等密码直到源服务器 LoginGraceTime 超时断连
+                    # （scp: Broken pipe）
+                    base = (f"SSH_ASKPASS={shq(askpass_path)} "
+                            f"DISPLAY=ucm-askpass setsid ")
+                shown = "SSH_ASKPASS=**** "
+            except BatchDeployError:
+                _try_rm(ssh, askpass_path)
+                raise
+            except Exception as exc:
+                _try_rm(ssh, askpass_path)
+                raise BatchDeployError(
+                    f"准备 SSH_ASKPASS 代输脚本失败: {exc}") from exc
+    cmd = (f"{base}scp -P {int(source.port)} -o StrictHostKeyChecking=no "
+           f"-o ConnectTimeout=10 {shq(remote_src)} {shq(dst_path)}")
+    log(f"$ {shown}scp -P {int(source.port)} ... {remote_src} -> {dst_path}")
+    progress(30, "scp 传输镜像包（服务器间直传）...")
+    try:
+        try:
+            res = ssh.exec_stream(cmd, on_line=lambda l: log(l),
+                                  timeout=7200, cancelled=cancelled)
+        finally:
+            if askpass_path:
+                _try_rm(ssh, askpass_path)   # 无论成败立即删除密码脚本
+    except Exception as exc:
+        _try_rm(ssh, dst_path)
+        raise BatchDeployError(f"scp 传输失败: {exc}") from exc
+    if not res.ok:
+        detail = (res.stdout or "").strip()[-200:]
+        _try_rm(ssh, dst_path)
+        raise BatchDeployError(
+            f"scp 传输失败（退出码 {res.exit_code}）"
+            + (f": {detail}" if detail else ""))
 
 
 def pull_image_on_target(docker: DockerManager, image_ref: str,
@@ -460,6 +606,25 @@ def pull_image_on_target(docker: DockerManager, image_ref: str,
         raise BatchDeployError(f"docker pull 失败: {exc}") from exc
     progress(100, f"镜像 {image_ref} 拉取完成")
     return image_ref
+
+
+def write_ucm_config_on_target(
+        ssh: SSHClient, cfg: BatchUcmConfigConfig, container: str,
+        progress: Optional[ProgressFn] = None,
+        log: Optional[LogFn] = None) -> None:
+    """容器创建完成后把 UCM 配置文件写入目标容器（批量部署，可选）。
+
+    cfg.enabled=False 时不做任何事；失败抛 BatchDeployError。
+    """
+    if not cfg.enabled:
+        return
+    progress = progress or (lambda pct, msg: None)
+    progress(10, "写入 UCM 配置文件...")
+    try:
+        write_ucm_config_file(ssh, container, cfg.path, cfg.content, log=log)
+    except Exception as exc:
+        raise BatchDeployError(f"写入 UCM 配置文件失败: {exc}") from exc
+    progress(100, f"UCM 配置文件已写入 {cfg.path}")
 
 
 def stage_progress_ranges(stages: BatchStages) -> Dict[str, Tuple[int, int]]:
@@ -490,7 +655,7 @@ def detect_target_device(ssh: SSHClient,
     dev = DeviceDetector(ssh).detect()
     if dev.device_type not in (DeviceType.ASCEND, DeviceType.NVIDIA):
         raise BatchDeployError(
-            "未探测到加速设备（npu-smi/nvidia-smi 均无结果），无法按设备创建容器")
+            "未检测到加速设备（npu-smi/nvidia-smi 均无结果），无法按设备创建容器")
     log(f"设备: {dev.display}（{dev.device_type.value}）"
         + (f" / {dev.arch}" if dev.arch else ""))
     return dev

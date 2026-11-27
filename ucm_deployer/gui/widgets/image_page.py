@@ -360,7 +360,7 @@ class ImagePage(QWidget):
         elif dev is not None and dev.device_type == DeviceType.NVIDIA:
             self.platform_label.setText("cuda（服务器设备：NVIDIA GPU）")
         else:
-            self.platform_label.setText("-（未探测设备，默认按 ascend；建议先在步骤1探测）")
+            self.platform_label.setText("-（未探测设备，默认按 ascend；建议先在步骤1检测）")
 
     def _update_source_hint(self) -> None:
         hints = {
@@ -405,7 +405,7 @@ class ImagePage(QWidget):
     def _selected_base(self) -> Optional[str]:
         if self.source_combo.currentIndex() != 0:
             QMessageBox.information(
-                self, "请先完成镜像准备",
+                self, "请先完成 UCM镜像准备",
                 "请先导入本地镜像包或在服务器上拉取镜像。\n"
                 "操作成功后会自动切换回“服务器已有镜像”，再检查 UCM。")
             return None
