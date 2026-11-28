@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -39,9 +40,11 @@ from ...core.container_manager import (ContainerCreateConfig,
                                        write_ucm_config_file)
 from ...core.docker_manager import DockerError, DockerManager
 from ...core.models import DeviceType, UCMInfo, VolumeMount
+from ...core.shell import shq
 from ...core.ssh_client import SSHClient
 from ..state import AppContext
-from .common import (ParallelTaskPanel, QuickTask, RemoteDirDialog, combo_ref,
+from .common import (ParallelTaskPanel, QuickTask, RemoteDirDialog,
+                     RemoteMountDialog, combo_ref,
                      attach_resize_grip, fill_image_combo, setup_image_combo)
 
 
@@ -142,8 +145,8 @@ class ContainerPage(QWidget):
         top_layout.addWidget(self.reuse_hint)
         top_layout.addWidget(self.ascend_device_label)
 
-        # ---------- 2. 挂载（统一表：KV Cache / 模型 / 自定义，一套按钮）
-        mount_box = QGroupBox("2. 挂载（KV Cache / 模型 / 自定义）")
+        # ---------- 2. 容器目录映射（统一表：KV Cache / 模型 / 自定义）
+        mount_box = QGroupBox("2. 容器目录映射（KV Cache / 模型 / 自定义）")
 
         self.mount_type = QComboBox()
         self.mount_type.addItems(["KV Cache", "模型", "自定义"])
@@ -157,6 +160,11 @@ class ContainerPage(QWidget):
         self.mount_container.setPlaceholderText("容器内路径")
         mount_add_btn = QPushButton("➕ 添加")
         mount_add_btn.clicked.connect(self._mount_add)
+        remote_mount_btn = QPushButton("🌐 新增远端挂载")
+        remote_mount_btn.setToolTip(
+            "在宿主机上挂载远端文件系统（NFS over RDMA / DTFS），\n"
+            "挂载成功后自动把本地目录加入上方映射表")
+        remote_mount_btn.clicked.connect(self._remote_mount)
 
         self.mount_table = QTableWidget(0, 4)
         self.mount_table.setHorizontalHeaderLabels(
@@ -167,20 +175,12 @@ class ContainerPage(QWidget):
         self.mount_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.mount_table.setMaximumHeight(120)
         self.mount_table.setToolTip(
-            "所有挂载类型共用本表，操作统一：上方输入后「➕ 添加」，选中行「🗑 移除」。\n"
+            "所有挂载类型共用本表，操作统一：上方输入后「➕ 添加」；\n"
+            "**右键点击行**可「移除选中」「校验选中挂载」。\n"
             "KV Cache 行容器内路径自动与宿主机相同（vLLM 按相同路径读取）。\n"
             "默认表为空（即不挂载任何目录）；需要挂载模型时选择类型后添加。")
-
-        mount_del_btn = QPushButton("🗑 移除选中")
-        mount_check_btn = QPushButton("🔍 校验选中挂载")
-        mount_check_btn.setToolTip(
-            "按表格中选中的行校验（按住 Ctrl 可多选）：\n"
-            "· 通用：目录是否存在、位于什么文件系统（本地盘 / NFS / 3FS 等）\n"
-            "· 选中的多个 KV Cache 行：还要求位于同一文件系统"
-            "（vLLM 多目录 KV cache 的要求）\n"
-            "· 模型/自定义行：仅报告文件系统信息，无硬性要求")
-        mount_del_btn.clicked.connect(self._mount_del)
-        mount_check_btn.clicked.connect(self._kv_check)
+        self.mount_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.mount_table.customContextMenuRequested.connect(self._mount_menu)
 
         mount_layout = QVBoxLayout(mount_box)
         mount_layout.setSpacing(4)
@@ -191,13 +191,9 @@ class ContainerPage(QWidget):
         add_row.addWidget(QLabel("→ 容器内"))
         add_row.addWidget(self.mount_container, 1)
         add_row.addWidget(mount_add_btn)
+        add_row.addWidget(remote_mount_btn)
         mount_layout.addLayout(add_row)
         mount_layout.addWidget(self.mount_table)
-        mount_btns = QHBoxLayout()
-        mount_btns.addWidget(mount_del_btn)
-        mount_btns.addWidget(mount_check_btn)
-        mount_btns.addStretch(1)
-        mount_layout.addLayout(mount_btns)
 
         # ---------- 3. 容器配置
         cmd_box = QGroupBox("3. 容器配置")
@@ -626,6 +622,79 @@ class ContainerPage(QWidget):
             icon = QMessageBox.Information if ok else QMessageBox.Warning
             box = QMessageBox(icon, "挂载校验", "\n".join(parts))
             box.exec()
+
+        self._run_quick(fn, on_done)
+
+    # ---------------------------------------------------------- 右键菜单/远端挂载
+    def _mount_menu(self, pos) -> None:
+        """目录映射表右键菜单：移除选中 / 校验选中挂载。"""
+        menu = QMenu(self)
+        del_act = menu.addAction("🗑 移除选中")
+        chk_act = menu.addAction("🔍 校验选中挂载")
+        act = menu.exec(self.mount_table.viewport().mapToGlobal(pos))
+        if act is del_act:
+            self._mount_del()
+        elif act is chk_act:
+            self._kv_check()
+
+    def _remote_mount(self) -> None:
+        """打开「新增远端挂载」对话框（NFS over RDMA / DTFS）。"""
+        server = self.ctx.server
+        if server is None:
+            QMessageBox.information(
+                self, "提示", "请先在步骤1点选要登录的服务器")
+            return
+        dlg = RemoteMountDialog(self)
+        dlg.mount_requested.connect(
+            lambda: self._remote_mount_execute(dlg, server))
+        dlg.exec()
+
+    def _remote_mount_execute(self, dlg, server) -> None:
+        """在宿主机执行对话框生成的挂载命令；成功后把目录加入映射表。"""
+        err = dlg.validate()
+        if err:
+            QMessageBox.warning(dlg, "参数错误", err)
+            return
+        cmd = dlg.mount_command()
+        d = dlg.local_dir()
+        dlg.mount_btn.setEnabled(False)
+
+        def fn():
+            with SSHClient(server) as ssh:
+                res = ssh.exec(f"mkdir -p {shq(d)}", timeout=15)
+                if not res.ok:
+                    raise RuntimeError(
+                        f"创建挂载目录失败：{res.stderr or res.stdout}")
+                res = ssh.exec(cmd, timeout=60)
+                if not res.ok:
+                    raise RuntimeError(
+                        f"挂载命令执行失败：\n{cmd}\n{res.stderr or res.stdout}")
+                chk = ssh.exec(f"mountpoint -q {shq(d)}", timeout=15)
+                if not chk.ok:
+                    raise RuntimeError(
+                        "挂载命令已执行，但 mountpoint -q 未检测到挂载点")
+
+        def on_done(result, error):
+            dlg.mount_btn.setEnabled(True)
+            if error is not None:
+                QMessageBox.warning(dlg, "挂载失败", str(error))
+                return
+            mtype = dlg.table_type_combo.currentText()
+            if mtype == "模型":
+                for r in range(self.mount_table.rowCount()):
+                    if self.mount_table.item(r, 0).text() == "模型":
+                        QMessageBox.warning(
+                            dlg, "无法加入映射表",
+                            "「模型」类型仅允许一行（已存在），"
+                            "可改用其他类型或手动编辑现有模型行")
+                        return
+                self._add_mount_row("模型", d, "/models", True)
+            elif mtype == "KV Cache":
+                self._add_mount_row("KV Cache", d, d, False, lock_container=True)
+            else:
+                self._add_mount_row("自定义", d, d, False)
+            self.mount_table.scrollToBottom()
+            dlg.accept()
 
         self._run_quick(fn, on_done)
 

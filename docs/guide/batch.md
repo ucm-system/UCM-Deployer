@@ -40,7 +40,7 @@
 | 页签 | 配置 |
 |---|---|
 | **镜像与分发** | 分发方式（见下表）/ 源服务器 / 镜像引用 / 目标保存路径 |
-| **容器配置** | 容器名 / shm-size / --net / 端口映射（NVIDIA）/ KV Cache 目录 / 模型挂载（只读可选）/ 额外挂载 / **同名容器先删除再创建** / 附加 docker 参数 / **自定义 docker run 命令（可选，勾选后附加参数置灰——两者互斥）** |
+| **容器配置** | 容器名 / shm-size / --net / 端口映射（NVIDIA）/ **容器目录映射表**（KV Cache / 模型 / 自定义；**右键点击行**可「🗑 移除选中」「🔎 批量校验」）/ **🌐 批量新增远端挂载（NFS over RDMA / DTFS，见下文）** / **同名容器先删除再创建** / 附加 docker 参数 / **自定义 docker run 命令（可选，勾选后附加参数置灰——两者互斥）** |
 | **UCM文件配置** | 是否写入由右上角「创建容器并配置UCM文件」开关决定（创建容器即写入）；本页签配置**内容**（yaml，预填默认模板）与**容器内路径**（默认 `/workspace/ucm_config_example.yaml`）（详见下文） |
 | **预检配置** | 是否执行带宽检查（容器配置未添加 KV Cache 目录时禁用）/ 容器内挂载目录（默认带出第一个 KV Cache 路径）/ 自定义预检 JSON（未勾选时编辑框置灰，内容仅作参考） |
 
@@ -63,6 +63,14 @@
     - 路径须为绝对路径，默认 `/workspace/ucm_config_example.yaml`（步骤5 拉起命令的 `UCM_CONFIG_FILE` 与步骤4 复检可直接使用该路径）；
     - 编辑框预填参考默认模板，「🔁 恢复默认模板」按钮可随时还原；
     - 该配置随**部署模板导出/导入**（JSON 中 `ucm_config` 段：`enabled` / `content` / `path`）。
+
+!!! tip "批量新增远端挂载（NFS over RDMA / DTFS）"
+    「容器配置」页签映射表「➕ 添加」右侧的 **「🌐 批量新增远端挂载」**，在**全部勾选的目标服务器**宿主机上挂载远端文件系统：
+
+    - 支持两种方式：**NFS over RDMA**（参数：远端 IP / 远端 fs 名 / 本地挂载目录，命令模板 `mount -t nfs -o vers=3,nolock,proto=rdma,nconnect=8 <IP>:/<fs> <本地目录>`）与 **DTFS**（参数：远端 CID / 远端 fs 名 / 本地挂载目录，命令模板 `mount -t dtfs -o rw,eventual,cid=<CID>,dn=dns_local /<fs> <本地目录>`）；
+    - 本地挂载目录默认 `/mnt/<fs 名>`，各目标上不存在时自动 `mkdir -p` 创建；
+    - 挂载命令随输入实时生成，点「💾 在 N 台目标上挂载」后逐台并行执行：`mkdir -p` → 挂载 → `mountpoint -q` 校验，结果写入各服务器日志页签；
+    - 有任一目标成功即把本地目录加入映射表（类型可选 KV Cache / 模型 / 自定义，默认 KV Cache 映射到容器内相同路径）；部分失败时弹窗列出失败服务器（可用「🔎 批量校验」复核）。
 
 - **Ascend 目标**逐台现场探测实际存在的设备节点（`/dev/davinci*`、`/dev/ummu` 等，存在时自动 `--privileged`）与驱动/工具挂载；
 - **NVIDIA 目标**自动使用 `--runtime nvidia --gpus all`；

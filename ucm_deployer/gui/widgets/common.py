@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -567,6 +568,131 @@ class RemoteDirDialog(QDialog):
 
     def selected_path(self) -> Optional[str]:
         return self._selected
+
+
+# ============================================================ 远端文件系统挂载
+class RemoteMountDialog(QDialog):
+    """在宿主机上挂载远端文件系统（NFS over RDMA / DTFS）。
+
+    - NFS over RDMA：mount -t nfs -o vers=3,nolock,proto=rdma,nconnect=8 <IP>:/<fs> <dir>
+    - DTFS：mount -t dtfs -o rw,eventual,cid=<CID>,dn=dns_local /<fs> <dir>
+
+    本地挂载目录默认 /mnt/<fs 名>（不存在时由执行方 mkdir -p 创建）；
+    命令实时预览；点「挂载」时发射 mount_requested 信号，由调用方
+    （步骤3 / 批量部署页面）通过 SSH 执行并在成功后把目录加入挂载表。
+    """
+
+    mount_requested = Signal()
+
+    def __init__(self, parent, title: str = "新增远端挂载",
+                 ok_text: str = "💾 挂载") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(600)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["NFS over RDMA", "DTFS"])
+
+        self.peer_label = QLabel("远端 IP")
+        self.peer_edit = QLineEdit()
+        self.peer_edit.setPlaceholderText("NFS 服务器地址（如 192.168.1.10）")
+
+        self.fs_edit = QLineEdit("fs1")
+        self.fs_edit.setToolTip("远端文件系统名，如 fs1；命令中显示为 /fs1")
+
+        self.dir_edit = QLineEdit("/mnt/fs1")
+        self.dir_edit.setToolTip("宿主机本地挂载目录；默认 /mnt/<fs 名>，"
+                                 "不存在时执行挂载前会自动创建")
+        self._dir_dirty = False      # 用户手动改过目录后不再自动跟随 fs 名
+
+        self.table_type_combo = QComboBox()
+        self.table_type_combo.addItems(["KV Cache", "模型", "自定义"])
+        self.table_type_combo.setToolTip("挂载成功后把本地目录加入「容器目录映射」表；"
+                                         "KV Cache 映射到容器内相同路径")
+
+        self.cmd_preview = QPlainTextEdit()
+        self.cmd_preview.setReadOnly(True)
+        self.cmd_preview.setFixedHeight(52)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.Monospace)
+        self.cmd_preview.setFont(font)
+
+        self.mount_btn = QPushButton(ok_text)
+        self.mount_btn.setProperty("accent", True)
+        cancel_btn = QPushButton("取消")
+        self.mount_btn.clicked.connect(self.mount_requested.emit)
+        cancel_btn.clicked.connect(self.reject)
+
+        form = QFormLayout()
+        form.addRow("挂载方式", self.mode_combo)
+        form.addRow(self.peer_label, self.peer_edit)
+        form.addRow("远端 fs 名", self.fs_edit)
+        form.addRow("本地挂载目录", self.dir_edit)
+        form.addRow("加入映射表类型", self.table_type_combo)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("挂载命令（随输入实时生成，将在宿主机上执行）："))
+        layout.addWidget(self.cmd_preview)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(self.mount_btn)
+        layout.addLayout(btns)
+
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.fs_edit.textChanged.connect(self._on_fs_changed)
+        self.dir_edit.textEdited.connect(self._on_dir_edited)
+        for w in (self.peer_edit, self.fs_edit, self.dir_edit):
+            w.textChanged.connect(self._update_preview)
+
+        self._update_preview()
+
+    # ---- 行为
+    def _on_mode_changed(self, idx: int) -> None:
+        if idx == 0:
+            self.peer_label.setText("远端 IP")
+            self.peer_edit.setPlaceholderText("NFS 服务器地址（如 192.168.1.10）")
+        else:
+            self.peer_label.setText("远端 CID")
+            self.peer_edit.setPlaceholderText("DTFS 远端 CID（如 2200cc05777c3ef2）")
+        self._update_preview()
+
+    def _on_fs_changed(self, text: str) -> None:
+        if not self._dir_dirty:
+            fs = text.strip() or "fs1"
+            self.dir_edit.setText(f"/mnt/{fs}")
+
+    def _on_dir_edited(self, _text: str) -> None:
+        self._dir_dirty = True
+
+    def _update_preview(self, *_) -> None:
+        self.cmd_preview.setPlainText(self.mount_command())
+
+    # ---- 供调用方使用
+    def mount_command(self) -> str:
+        fs = self.fs_edit.text().strip() or "fs1"
+        d = self.dir_edit.text().strip() or f"/mnt/{fs}"
+        if self.mode_combo.currentIndex() == 0:
+            peer = self.peer_edit.text().strip()
+            return (f"mount -t nfs -o vers=3,nolock,proto=rdma,nconnect=8 "
+                    f"{peer}:/{fs} {d}")
+        peer = self.peer_edit.text().strip()
+        return f"mount -t dtfs -o rw,eventual,cid={peer},dn=dns_local /{fs} {d}"
+
+    def validate(self) -> Optional[str]:
+        """返回错误提示文本；None 表示参数可用。"""
+        if not self.peer_edit.text().strip():
+            return f"请填写{self.peer_label.text()}"
+        if not self.fs_edit.text().strip():
+            return "请填写远端 fs 名"
+        d = self.dir_edit.text().strip()
+        if not d.startswith("/"):
+            return "本地挂载目录必须是以 / 开头的绝对路径"
+        return None
+
+    def local_dir(self) -> str:
+        return self.dir_edit.text().strip()
 
 
 # ============================================================ 输入框拖动手柄

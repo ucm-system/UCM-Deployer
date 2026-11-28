@@ -1050,6 +1050,134 @@ def test_container_page_mount_check_selected(qapp, tmp_path, fake_ssh, monkeypat
     assert not any("不在同一文件系统" in b for b in boxes), boxes
 
 
+def test_container_page_mount_context_menu_and_rename(qapp, tmp_path):
+    """模块2 改名「容器目录映射」；移除/校验按钮撤除、改右键菜单。"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QGroupBox
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    ctx.selected = [ServerInfo.create(name="n1", host="127.0.0.1")]
+    page = ContainerPage(ctx)
+
+    boxes = [b.title() for b in page.findChildren(QGroupBox)]
+    assert any(b.startswith("2. 容器目录映射") for b in boxes), boxes
+
+    assert page.mount_table.contextMenuPolicy() == Qt.CustomContextMenu
+    # 旧按钮已撤除（不再有 移除选中/校验选中 文本按钮）
+    from PySide6.QtWidgets import QPushButton
+    btn_texts = [b.text() for b in page.findChildren(QPushButton)]
+    assert not any("移除选中" in t for t in btn_texts), btn_texts
+    assert not any("校验选中挂载" in t for t in btn_texts), btn_texts
+    assert any("新增远端挂载" in t for t in btn_texts), btn_texts
+
+
+def test_container_page_remote_mount_nfs(qapp, tmp_path, fake_ssh):
+    """新增远端挂载（NFS over RDMA）：命令预览正确；挂载成功后
+    mkdir -p → mount → mountpoint 校验，并把目录加入映射表（KV Cache）。"""
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.common import RemoteMountDialog
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    fake_ssh.add_default(r"^mkdir -p /mnt/fs1", stdout="")
+    fake_ssh.add_default(r"^mount -t nfs", stdout="")
+    fake_ssh.add_default(r"^mountpoint -q", stdout="")
+
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [s]
+    page = ContainerPage(ctx)
+
+    dlg = RemoteMountDialog(page)
+    assert dlg.mode_combo.currentIndex() == 0
+    assert dlg.mount_command() == (
+        "mount -t nfs -o vers=3,nolock,proto=rdma,nconnect=8 :/fs1 /mnt/fs1")
+    dlg.peer_edit.setText("192.168.1.10")
+    assert dlg.mount_command() == (
+        "mount -t nfs -o vers=3,nolock,proto=rdma,nconnect=8 "
+        "192.168.1.10:/fs1 /mnt/fs1")
+    # fs 名变化 → 默认目录自动跟随；手动编辑后不再跟随
+    dlg.fs_edit.setText("fs2")
+    assert dlg.dir_edit.text() == "/mnt/fs2"
+    dlg.dir_edit.setText("/data/fs2")
+    dlg.dir_edit.textEdited.emit("/data/fs2")   # 模拟用户手动编辑
+    dlg.fs_edit.setText("fs3")
+    assert dlg.dir_edit.text() == "/data/fs2"
+    dlg.fs_edit.setText("fs1")
+    dlg.dir_edit.setText("/mnt/fs1")
+
+    dlg.table_type_combo.setCurrentIndex(0)     # KV Cache
+    page._remote_mount_execute(dlg, s)
+    import time as _t
+    deadline = _t.time() + 15
+    while page._quick_tasks and _t.time() < deadline:
+        qapp.processEvents()
+        _t.sleep(0.05)
+    qapp.processEvents()
+
+    assert page.mount_table.rowCount() == 1
+    assert page.mount_table.item(0, 0).text() == "KV Cache"
+    assert page.mount_table.item(0, 1).text() == "/mnt/fs1"
+    assert page.mount_table.item(0, 2).text() == "/mnt/fs1"
+    cmds = [c.executed_command for c in fake_ssh.instances[0].channels]
+    assert any("mkdir -p /mnt/fs1" in c for c in cmds), cmds
+    assert any(c.startswith("mount -t nfs -o vers=3,nolock,proto=rdma,"
+                            "nconnect=8 192.168.1.10:/fs1 /mnt/fs1")
+               for c in cmds), cmds
+    assert any(c.startswith("mountpoint -q") for c in cmds), cmds
+
+
+def test_container_page_remote_mount_dtfs(qapp, tmp_path, fake_ssh,
+                                          monkeypatch):
+    """DTFS 挂载：命令格式 cid/dn=dns_local；挂载失败时提示且不加行。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from ucm_deployer.core.models import ServerInfo
+    from ucm_deployer.core.server_registry import ServerRegistry
+    from ucm_deployer.gui.state import AppContext
+    from ucm_deployer.gui.widgets.common import RemoteMountDialog
+    from ucm_deployer.gui.widgets.container_page import ContainerPage
+
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: (warnings.append(a[2] if len(a) > 2 else ""),
+                                      QMessageBox.StandardButton.Ok)[1]))
+
+    # 未注册 mkdir/mount 命令 → fake_ssh 返回 127 → 挂载失败
+    ctx = AppContext(ServerRegistry(tmp_path))
+    s = ServerInfo.create(name="n1", host="127.0.0.1")
+    ctx.selected = [s]
+    page = ContainerPage(ctx)
+
+    dlg = RemoteMountDialog(page)
+    dlg.mode_combo.setCurrentIndex(1)           # DTFS
+    assert dlg.peer_label.text() == "远端 CID"
+    dlg.peer_edit.setText("2200cc05777c3ef2")
+    dlg.fs_edit.setText("fs1")
+    dlg.dir_edit.setText("/mnt/fs1")
+    assert dlg.mount_command() == (
+        "mount -t dtfs -o rw,eventual,cid=2200cc05777c3ef2,"
+        "dn=dns_local /fs1 /mnt/fs1")
+
+    page._remote_mount_execute(dlg, s)
+    import time as _t
+    deadline = _t.time() + 15
+    while page._quick_tasks and _t.time() < deadline:
+        qapp.processEvents()
+        _t.sleep(0.05)
+    qapp.processEvents()
+
+    assert warnings and "挂载" in warnings[0], warnings
+    assert page.mount_table.rowCount() == 0
+
+
 def test_check_container_ucm_status_messages(qapp, tmp_path, fake_ssh,
                                              monkeypatch):
     """检查容器 UCM：状态栏简短且指明容器；任务标题带容器名；
