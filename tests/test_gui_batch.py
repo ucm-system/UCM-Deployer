@@ -392,6 +392,54 @@ def _script_common(fake_ssh):
     fake_ssh.add_default(r"ucm-toolkit run precheck", stdout=_PRECHECK_OUT)
 
 
+def test_batch_page_mount_context_menu_and_remote_btn(qapp, tmp_path):
+    """挂载表：移除/批量校验改右键菜单；新增「批量新增远端挂载」按钮。"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QPushButton
+
+    page = make_page(qapp, tmp_path)
+    assert page.mount_table.contextMenuPolicy() == Qt.CustomContextMenu
+    btn_texts = [b.text() for b in page.findChildren(QPushButton)]
+    assert not any("移除选中" in t for t in btn_texts), btn_texts
+    assert not any("批量校验" in t for t in btn_texts), btn_texts
+    assert any("批量新增远端挂载" in t for t in btn_texts), btn_texts
+
+
+def test_batch_page_remote_mount(qapp, tmp_path, fake_ssh):
+    """批量新增远端挂载：在勾选目标宿主机上 mkdir -p → mount → mountpoint，
+    成功后目录加入映射表（KV Cache，同路径锁定）。"""
+    from ucm_deployer.gui.widgets.common import RemoteMountDialog
+
+    page = make_page(qapp, tmp_path)
+    servers = add_servers(page.ctx, 2)
+    page.refresh_servers()
+    check_target(page, servers[0], qapp)
+    check_target(page, servers[1], qapp)
+
+    fake_ssh.add_default(r"^mkdir -p /mnt/fs1", stdout="")
+    fake_ssh.add_default(r"^mount -t nfs", stdout="")
+    fake_ssh.add_default(r"^mountpoint -q", stdout="")
+
+    dlg = RemoteMountDialog(page, title="批量新增远端挂载")
+    dlg.peer_edit.setText("192.168.1.10")
+    dlg.fs_edit.setText("fs1")
+    assert dlg.dir_edit.text() == "/mnt/fs1"
+    dlg.table_type_combo.setCurrentIndex(0)     # KV Cache
+
+    page._remote_mount_execute(dlg, servers)
+    assert _wait_panel(page.panel, qapp)
+
+    assert page.mount_table.rowCount() == 1
+    assert page.mount_table.item(0, 0).text() == "KV Cache"
+    assert page.mount_table.item(0, 1).text() == "/mnt/fs1"
+    for inst in fake_ssh.instances:
+        cmds = [c.executed_command for c in inst.channels]
+        assert any("mkdir -p /mnt/fs1" in c for c in cmds), cmds
+        assert any(c.startswith("mount -t nfs") and "192.168.1.10:/fs1" in c
+                   for c in cmds), cmds
+        assert any(c.startswith("mountpoint -q") for c in cmds), cmds
+
+
 def test_batch_page_ucm_config_write(qapp, tmp_path, fake_ssh):
     """「UCM文件配置」页签：勾选后容器创建完成即写入各目标容器。"""
     page = make_page(qapp, tmp_path)

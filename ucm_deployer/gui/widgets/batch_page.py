@@ -72,7 +72,7 @@ from ...core.device_detector import summarize_env_status
 from ...core.models import ServerInfo, VolumeMount
 from ...core.shell import shq
 from ..state import AppContext
-from .common import ParallelTaskPanel, attach_resize_grip
+from .common import ParallelTaskPanel, RemoteMountDialog, attach_resize_grip
 
 # 自定义预检配置默认模板（叠加于 ucm-toolkit 出厂默认之上，只需写要覆盖的键；
 # 常用键参考 ucm-toolkit 出厂默认 precheck.defaults.json / 步骤4「预检参数配置」）
@@ -377,6 +377,11 @@ class BatchPage(QWidget):
         self.mount_container_edit.setPlaceholderText("容器内路径")
         mount_add_btn = QPushButton("➕ 添加")
         mount_add_btn.clicked.connect(self._mount_add)
+        remote_mount_btn = QPushButton("🌐 批量新增远端挂载")
+        remote_mount_btn.setToolTip(
+            "在全部勾选的目标服务器宿主机上挂载远端文件系统"
+            "（NFS over RDMA / DTFS），\n挂载成功后自动把本地目录加入上方映射表")
+        remote_mount_btn.clicked.connect(self._remote_mount)
 
         self.mount_table = QTableWidget(0, 4)
         self.mount_table.setHorizontalHeaderLabels(
@@ -387,22 +392,17 @@ class BatchPage(QWidget):
         self.mount_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.mount_table.setMinimumHeight(150)
         self.mount_table.setToolTip(
-            "所有挂载类型共用本表：上方输入后「➕ 添加」，选中行「🗑 移除」。\n"
+            "所有挂载类型共用本表：上方输入后「➕ 添加」；\n"
+            "**右键点击行**可「移除选中」「批量校验」。\n"
             "KV Cache 行容器内路径自动与宿主机相同（锁定不可改）。\n"
             "默认表为空（即不挂载任何目录）；需要挂载模型时选择类型后添加。")
-        mount_del_btn = QPushButton("🗑 移除选中")
-        mount_del_btn.clicked.connect(self._mount_del)
-        mount_verify_btn = QPushButton("🔎 批量校验")
-        mount_verify_btn.setToolTip(
-            "对全部勾选的目标服务器逐一检查挂载表中每个宿主机路径是否存在\n"
-            "（test -d），结果写入各服务器日志页签；分发/创建前先校验可\n"
-            "避免因目录缺失导致的挂载失败。")
-        mount_verify_btn.clicked.connect(self._mount_verify)
         # 挂载表变化联动「执行存储带宽检查」可用性（需存在 KV Cache 目录）
         mount_model = self.mount_table.model()
         mount_model.rowsInserted.connect(self._update_bandwidth_state)
         mount_model.rowsRemoved.connect(self._update_bandwidth_state)
         self.mount_table.itemChanged.connect(self._update_bandwidth_state)
+        self.mount_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.mount_table.customContextMenuRequested.connect(self._mount_menu)
 
         add_row = QHBoxLayout()
         add_row.addWidget(QLabel("类型"))
@@ -411,8 +411,7 @@ class BatchPage(QWidget):
         add_row.addWidget(QLabel("→ 容器内"))
         add_row.addWidget(self.mount_container_edit, 1)
         add_row.addWidget(mount_add_btn)
-        add_row.addWidget(mount_verify_btn)
-        add_row.addWidget(mount_del_btn)
+        add_row.addWidget(remote_mount_btn)
         lay.addLayout(add_row)
         lay.addWidget(self.mount_table)
 
@@ -962,6 +961,102 @@ class BatchPage(QWidget):
         self.panel.run_tasks(
             [(s, fn) for s in servers],
             f"批量校验挂载路径（{len(paths)} 个路径 × {len(servers)} 台）")
+
+    # ---------------------------------------------------------- 右键菜单/远端挂载
+    def _mount_menu(self, pos) -> None:
+        """挂载表右键菜单：移除选中 / 批量校验。"""
+        menu = QMenu(self)
+        del_act = menu.addAction("🗑 移除选中")
+        chk_act = menu.addAction("🔎 批量校验")
+        act = menu.exec(self.mount_table.viewport().mapToGlobal(pos))
+        if act is del_act:
+            self._mount_del()
+        elif act is chk_act:
+            self._mount_verify()
+
+    def _remote_mount(self) -> None:
+        """打开「批量新增远端挂载」对话框（NFS over RDMA / DTFS）。"""
+        servers = self._selected_targets()
+        if not servers:
+            QMessageBox.warning(
+                self, "未选择目标服务器",
+                "请先在「1. 目标服务器」勾选要在其宿主机上挂载的服务器")
+            return
+        dlg = RemoteMountDialog(
+            self, title="批量新增远端挂载",
+            ok_text=f"💾 在 {len(servers)} 台目标上挂载")
+        dlg.mount_requested.connect(
+            lambda: self._remote_mount_execute(dlg, servers))
+        dlg.exec()
+
+    def _remote_mount_execute(self, dlg, servers) -> None:
+        """在全部勾选目标宿主机上并行执行挂载；成功后把目录加入映射表。"""
+        err = dlg.validate()
+        if err:
+            QMessageBox.warning(dlg, "参数错误", err)
+            return
+        cmd = dlg.mount_command()
+        d = dlg.local_dir()
+        dlg.mount_btn.setEnabled(False)
+        outcome: Dict[str, Tuple[bool, str]] = {}
+
+        def make_fn(server):
+            def fn(ssh, tctx):
+                tctx.progress(5, f"创建挂载目录 {d}")
+                res = ssh.exec(f"mkdir -p {shq(d)}", timeout=15)
+                if not res.ok:
+                    raise RuntimeError(
+                        f"创建挂载目录失败：{res.stderr or res.stdout}")
+                tctx.progress(30, "执行挂载命令")
+                res = ssh.exec(cmd, timeout=60)
+                if not res.ok:
+                    raise RuntimeError(
+                        f"挂载命令执行失败：\n{cmd}\n{res.stderr or res.stdout}")
+                chk = ssh.exec(f"mountpoint -q {shq(d)}", timeout=15)
+                if not chk.ok:
+                    raise RuntimeError(
+                        "挂载命令已执行，但 mountpoint -q 未检测到挂载点")
+                outcome[server.id] = (True, "挂载成功")
+                tctx.progress(100, "挂载完成")
+            return fn
+
+        def on_finished(all_ok: bool) -> None:
+            dlg.mount_btn.setEnabled(True)
+            failed = [s for s in servers
+                      if outcome.get(s.id, (False, ""))[0] is False]
+            if len(failed) == len(servers):
+                QMessageBox.warning(dlg, "挂载失败",
+                                    "全部目标服务器挂载失败，详情见各服务器日志页签")
+                return
+            mtype = dlg.table_type_combo.currentText()
+            if mtype == "模型":
+                for r in range(self.mount_table.rowCount()):
+                    if self.mount_table.item(r, 0).text() == "模型":
+                        QMessageBox.warning(
+                            dlg, "无法加入映射表",
+                            "「模型」类型仅允许一行（已存在），"
+                            "可改用其他类型或手动编辑现有模型行")
+                        return
+            if mtype == "KV Cache":
+                self._add_mount_row("KV Cache", d, d, False)
+            elif mtype == "模型":
+                self._add_mount_row("模型", d, "/models", True)
+            else:
+                self._add_mount_row("自定义", d, d, False)
+            self.mount_table.scrollToBottom()
+            if failed:
+                names = "、".join((s.name or s.host) for s in failed)
+                QMessageBox.warning(
+                    dlg, "部分目标挂载失败",
+                    f"以下服务器挂载失败（目录仍加入映射表，可批量校验确认）：\n{names}")
+            dlg.accept()
+
+        started = self.panel.run_tasks(
+            [(s, make_fn(s)) for s in servers],
+            f"批量挂载远端文件系统 {d}（{len(servers)} 台）",
+            on_finished=on_finished)
+        if not started:
+            dlg.mount_btn.setEnabled(True)
 
     def _on_bandwidth_toggled(self, checked: bool) -> None:
         self.mount_edit.setEnabled(checked and self._has_kv_mount())
